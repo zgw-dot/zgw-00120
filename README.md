@@ -396,7 +396,7 @@ created ──assign──> assigned ──complete──> completed ──verif
 | `test-acceptance.ps1` | 31 个基础验收场景（CRUD + 状态机 + 冲突检测 + 导出导入） | 是 |
 | `test-overdue-regression.ps1` | 逾期计算回归：快照周期 vs 活跃配置、导出导入、确定性、失败场景回归 | 是（每次运行用随机 `runId` 生成唯一序列号，避免撞库） |
 | `test-overdue-explain.ps1` | 逾期规则追溯完整链路：配置切换、退回重开、打开工单不混用、活跃配置兜底、导出导入追溯、确定性验证 | 是 |
-| `test-overdue-reconciliation.ps1` | **批量对账视图**：配置切换 mismatch 检测、退回重开、无已复核工单 fallback、无活跃配置 unavailable、导出导入分组一致性、include_non_overdue 参数、与 /explain 交叉验证、确定性 | 是 |
+| `test-overdue-reconciliation.ps1` | **批量对账视图**：SC1 配置切换 mismatch、SC2 退回重开、SC3 无已复核工单 fallback、SC4 无活跃配置 unavailable、SC5 导出导入分组一致性、SC6 多次查询确定性、SC7 include_non_overdue 参数、SC8 与 /explain 交叉验证、SC9 跨重启完整结果字节级一致性 | 是（**powershell 5.1 / pwsh 双端兼容**，脚本为 UTF-8 BOM 编码；SC9 需手动重启并按回车） |
 
 ```powershell
 # 启动服务
