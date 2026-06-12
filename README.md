@@ -113,6 +113,7 @@ SQLite 数据库文件：`data/calibration.db`（首次启动自动创建）。
 | GET | `/api/overdue` | 逾期清单（`?as_of=2026-06-12` 指定基准日期） |
 | GET | `/api/overdue/explain` | 逾期规则追溯（完整解释每条结果按哪条规则算出） |
 | GET | `/api/overdue/explain/:instrumentId` | 单仪器逾期规则追溯 |
+| GET | `/api/overdue/reconciliation` | 批量对账视图（汇总计数 + 分组 + 不一致明细 + 未完成工单说明） |
 
 > 计算逻辑：对每个活跃仪器，取最近 verified 工单的 verified_date + cycle_days_snapshot，若超过基准日期则标记逾期。
 
@@ -220,6 +221,142 @@ SQLite 数据库文件：`data/calibration.db`（首次启动自动创建）。
 
 6. **服务重启**：explain 完全基于数据库实时查询计算，无缓存状态，重启后结果不变。多次查询结果完全一致（确定性验证）。
 
+#### 批量对账视图 (`/api/overdue/reconciliation`)
+
+**查询参数**：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `as_of` | string | 基准日期 `YYYY-MM-DD`，默认今天 |
+| `include_non_overdue` | string | `"true"` 时返回所有仪器（含未逾期），默认只返回逾期或有未完成工单的 |
+
+**顶层返回字段**：
+
+| 字段 | 说明 |
+|---|---|
+| `summary` | 汇总计数 |
+| `cycle_source_breakdown` | 周期来源分组计数 |
+| `reason_code_breakdown` | 原因代码分组计数 |
+| `cycle_mismatch` | 快照周期与活跃周期不一致明细 |
+| `open_orders` | 未完成工单明细 |
+| `grouped_instruments` | 按来源分组的仪器完整列表 |
+
+**`summary` 字段**：
+
+| 字段 | 说明 |
+|---|---|
+| `as_of` | 基准日期 |
+| `total_instruments` | 仪器总数 |
+| `shown_instruments` | 本次展示的仪器数 |
+| `overdue_count` | 逾期仪器数 |
+| `with_open_order_count` | 有未完成工单的仪器数 |
+| `unavailable_count` | 无法计算（无活跃配置）的仪器数 |
+| `include_non_overdue` | 本次请求的 include_non_overdue 取值 |
+
+**`cycle_source_breakdown` 字段**（key 为 cycle_source，value 为计数）：
+
+| key | 含义 |
+|---|---|
+| `work_order_snapshot` | 按最近已复核工单快照周期计算 |
+| `active_config_fallback` | 无已复核工单，走活跃配置兜底 |
+| `unavailable` | 无活跃配置，无法计算 |
+
+**`grouped_instruments` 三组的关键字段**：
+
+| 组 | 关键字段 |
+|---|---|
+| `work_order_snapshot` | `instrument_id`, `applied_cycle_days`, `next_due_date`, `work_order_id`, `verified_date`, `snapshot_config_id`, `snapshot_config_version` |
+| `active_config_fallback` | `instrument_id`, `applied_cycle_days`, `next_due_date`, `fallback_reason_code`, `fallback_reason_message`, `active_config_id` |
+| `unavailable` | `instrument_id`, `unavailable_reason_code`, `unavailable_reason_message`, `has_open_work_order` |
+
+**`cycle_mismatch` 字段**（仅快照周期与活跃周期不一致时才有记录）：
+
+| 字段 | 说明 |
+|---|---|
+| `count` | 不一致的仪器数量 |
+| `note` | 规则说明文字 |
+| `details[].snapshot_config` | `{id, version, cycle_days}` 工单创建时快照 |
+| `details[].active_config` | `{id, version, cycle_days}` 当前活跃配置 |
+| `details[].cycle_diff_days` | 活跃周期减快照周期的差值 |
+| `details[].applied_cycle_days` | 实际参与计算的周期（= 快照周期） |
+| `details[].mismatch_reason` | 文字说明 |
+
+**`open_orders` 字段**：
+
+| 字段 | 说明 |
+|---|---|
+| `count` | 未完成工单数量 |
+| `participation_rule` | **规则说明**：未完成工单（created/assigned/completed/returned）**只展示，不参与 next_due_date 计算**。next_due_date 仅基于已复核工单或活跃配置兜底。 |
+| `details[].cycle_source_used_for_calc` | next_due_date 实际使用的计算来源 |
+| `details[].open_order_participation` | 固定值：`未参与 next_due_date 计算，仅作参考展示` |
+| `details[].participation_note` | 文字说明 |
+
+**边界场景说明**：
+
+1. **配置切换**：工单创建后配置版本更新，reconciliation 会将此仪器列入 `cycle_mismatch.details`，标注 snapshot/active 的 cycle 差，`applied_cycle_days` 始终取快照值。
+2. **退回重开**：工单退回后重新完成并复核，`cycle_mismatch` 中 `snapshot_config.cycle_days` 仍为创建时原值，不受退回期间配置切换影响。
+3. **无已复核工单**：仪器进入 `grouped_instruments.active_config_fallback` 组，`fallback_reason_code` 为 `NO_WORK_ORDERS_AT_ALL` 或 `ONLY_OPEN_ORDERS`。
+4. **无活跃配置**：仪器进入 `grouped_instruments.unavailable` 组，`unavailable_reason_code` 为 `NO_ACTIVE_CONFIG`。
+5. **未完成工单**：出现在 `open_orders.details` 中，明确标注"只展示，不参与计算"。其仪器仍可能出现在 `work_order_snapshot` 或 `active_config_fallback` 组中（按各自的 next_due_date 计算来源）。
+6. **导出再导入**：导入后分组不变，`work_order_snapshot` 组的 `snapshot_config_id`、`snapshot_config_version`、`work_order_id` 与导入前一致。
+7. **服务重启**：完全基于数据库计算，重启后同日查询结果字节级一致。
+
+##### Reconciliation 接口验证命令
+
+**1. curl (bash)**
+
+```bash
+# 默认：只返回逾期或有未完成工单的
+curl -s "http://localhost:3000/api/overdue/reconciliation?as_of=2026-08-01" | python3 -m json.tool
+
+# 返回所有仪器（含未逾期）
+curl -s "http://localhost:3000/api/overdue/reconciliation?as_of=2026-08-01&include_non_overdue=true" | python3 -m json.tool
+```
+
+**2. Python requests**
+
+```python
+import requests
+
+BASE = "http://localhost:3000/api"
+
+r = requests.get(f"{BASE}/overdue/reconciliation", params={
+    "as_of": "2026-08-01",
+    "include_non_overdue": "true"
+})
+data = r.json()["data"]
+
+print("total:", data["summary"]["total_instruments"])
+print("overdue:", data["summary"]["overdue_count"])
+print("unavailable:", data["summary"]["unavailable_count"])
+print("breakdown:", data["cycle_source_breakdown"])
+print("cycle_mismatch count:", data["cycle_mismatch"]["count"])
+print("open_orders count:", data["open_orders"]["count"])
+print("rule:", data["open_orders"]["participation_rule"])
+```
+
+**3. 完整测试脚本**
+
+```powershell
+# 覆盖 9 个场景：配置切换 / 退回重开 / 无已复核 / 无活跃配置 /
+# 导入导出 / 多次查询确定性 / include_non_overdue / 与 /explain 交叉验证 / 跨重启一致性
+pwsh -ExecutionPolicy Bypass -File .\test-overdue-reconciliation.ps1
+```
+
+**预期结果**（测试脚本 SCENARIO 覆盖）：
+
+| 场景 | 预期结果 |
+|---|---|
+| SC1 配置切换 | `cycle_mismatch.count >= 1`，`snapshot.cycle_days=7`，`active.cycle_days=60`，`applied=7` |
+| SC2 退回重开 | `cycle_mismatch` 中 `snapshot.cycle_days=14`（创建时原值），`active.cycle_days=21` |
+| SC3 无已复核 | 仪器在 `active_config_fallback` 组；开单未完成时 `fallback_reason_code=ONLY_OPEN_ORDERS`，出现在 `open_orders.details` 中，标注"只展示不参与计算" |
+| SC4 无活跃配置 | 仪器在 `unavailable` 组，`unavailable_reason_code=NO_ACTIVE_CONFIG` |
+| SC5 导入导出 | `work_order_snapshot` 组中 `snapshot_config_id` / `work_order_id` / `applied_cycle_days` 与导入前一致 |
+| SC6 确定性 | 三次同参数查询，`ConvertTo-Json -Compress` 输出完全相同 |
+| SC7 参数 | `include_non_overdue=true` 的 `shown_instruments >=` 默认值 |
+| SC8 交叉验证 | reconciliation 分组中的 `applied_cycle_days` / `next_due_date` 与 `/explain` 返回一致 |
+| SC9 跨重启 | 服务重启后 `summary.*` / `cycle_source_breakdown` / `cycle_mismatch.count` / 分组明细均与重启前完全一致 |
+
 ### 审计事件
 
 | 方法 | 路径 | 说明 |
@@ -258,7 +395,10 @@ created ──assign──> assigned ──complete──> completed ──verif
 |---|---|---|
 | `test-acceptance.ps1` | 31 个基础验收场景（CRUD + 状态机 + 冲突检测 + 导出导入） | 是 |
 | `test-overdue-regression.ps1` | 逾期计算回归：快照周期 vs 活跃配置、导出导入、确定性、失败场景回归 | 是（每次运行用随机 `runId` 生成唯一序列号，避免撞库） |
-| `test-overdue-explain.ps1` | 逾期规则追溯完整链路：配置切换、退回重开、打开工单不混用、活跃配置兜底、导出导入追溯、确定性验证 | 是 |```powershell
+| `test-overdue-explain.ps1` | 逾期规则追溯完整链路：配置切换、退回重开、打开工单不混用、活跃配置兜底、导出导入追溯、确定性验证 | 是 |
+| `test-overdue-reconciliation.ps1` | **批量对账视图**：配置切换 mismatch 检测、退回重开、无已复核工单 fallback、无活跃配置 unavailable、导出导入分组一致性、include_non_overdue 参数、与 /explain 交叉验证、确定性 | 是 |
+
+```powershell
 # 启动服务
 npm start
 
@@ -267,7 +407,9 @@ powershell -ExecutionPolicy Bypass -File .\test-overdue-regression.ps1
 powershell -ExecutionPolicy Bypass -File .\test-overdue-explain.ps1
 pwsh -ExecutionPolicy Bypass -File .\test-overdue-reconciliation.ps1
 powershell -ExecutionPolicy Bypass -File .\test-acceptance.ps1
-```### 单条 PowerShell 命令速查
+```
+
+### 单条 PowerShell 命令速查
 
 ```powershell
 # 健康检查

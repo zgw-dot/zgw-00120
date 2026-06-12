@@ -1,9 +1,16 @@
+$ErrorActionPreference = 'Stop'
 $base = "http://localhost:3000/api"
 $pass = 0
 $fail = 0
 
 $runId = Get-Random -Minimum 10000 -Maximum 99999
 Write-Host "  run_id=$runId (isolation suffix for reproducible runs)"
+
+function To-DateStr($val) {
+    if ($null -eq $val) { return $null }
+    if ($val -is [DateTime]) { return $val.ToString('yyyy-MM-dd') }
+    return $val.ToString().Split('T')[0]
+}
 
 function Assert-True($name, $condition, $detail = "") {
     if ($condition) {
@@ -100,7 +107,7 @@ Invoke-RestMethod -Uri "$base/work-orders/$wo1Id/complete" -Method Post -Body $c
 
 $vr1Body = @{ verified_by = "QA Manager" } | ConvertTo-Json
 $wo1Verified = (Invoke-RestMethod -Uri "$base/work-orders/$wo1Id/verify" -Method Post -Body $vr1Body -ContentType "application/json").data
-$wo1VerifiedDate = $wo1Verified.verified_date.Split('T')[0]
+$wo1VerifiedDate = To-DateStr $wo1Verified.verified_date
 
 $cfg1v2Body = @{ instrument_id = $inst1Id; cycle_days = 60 } | ConvertTo-Json
 $cfg1v2 = (Invoke-RestMethod -Uri "$base/configs" -Method Post -Body $cfg1v2Body -ContentType "application/json").data
@@ -181,7 +188,7 @@ Invoke-RestMethod -Uri "$base/work-orders/$wo2Id/complete" -Method Post -Body $c
 
 $vr2Body = @{ verified_by = "Senior QA" } | ConvertTo-Json
 $wo2Final = (Invoke-RestMethod -Uri "$base/work-orders/$wo2Id/verify" -Method Post -Body $vr2Body -ContentType "application/json").data
-$wo2FinalDate = $wo2Final.verified_date.Split('T')[0]
+$wo2FinalDate = To-DateStr $wo2Final.verified_date
 
 $asOfS2 = $today.AddDays(20).ToString("yyyy-MM-dd")
 $recon2Url = "$base/overdue/reconciliation?as_of=$asOfS2`&include_non_overdue=true"
@@ -441,6 +448,58 @@ Assert-Eq "cycle_source consistent: work_order_snapshot" $exp8.trace.cycle_sourc
 $mismatch8 = $recon8.cycle_mismatch.details | Where-Object { $_.instrument_id -eq $inst1Id }
 Assert-Eq "mismatch applied_cycle_days == explain applied" $mismatch8.applied_cycle_days $exp8.base_calculation.applied_cycle_days
 Assert-Eq "mismatch snapshot_config.version == explain snapshot_config.version" $mismatch8.snapshot_config.version $exp8.trace.snapshot_config.version
+
+# ===================================================================
+# SCENARIO 9: Cross-restart consistency (完整结果字节级比较)
+# ===================================================================
+Write-Host ""
+Write-Host "--- SCENARIO 9: Cross-restart determinism (full result byte-for-byte) ---" -ForegroundColor Yellow
+
+$asOfS9 = $today.AddDays(45).ToString("yyyy-MM-dd")
+$recon9Url = "$base/overdue/reconciliation?as_of=$asOfS9`&include_non_overdue=true"
+
+$beforeRestartA = (Invoke-RestMethod -Uri $recon9Url -Method Get).data
+$beforeRestartB = (Invoke-RestMethod -Uri $recon9Url -Method Get).data
+
+$jsonPreA = $beforeRestartA | ConvertTo-Json -Depth 10 -Compress
+$jsonPreB = $beforeRestartB | ConvertTo-Json -Depth 10 -Compress
+
+Assert-Eq "pre-restart qA == qB (twice same result)" $jsonPreA $jsonPreB
+
+$preSummary = $beforeRestartA.summary
+$preBreakdown = $beforeRestartA.cycle_source_breakdown | ConvertTo-Json -Compress
+$preMismatchCount = $beforeRestartA.cycle_mismatch.count
+$preOpenCount = $beforeRestartA.open_orders.count
+$preWoSnapCount = $beforeRestartA.grouped_instruments.work_order_snapshot.Count
+$preFallbackCount = $beforeRestartA.grouped_instruments.active_config_fallback.Count
+$preUnavailCount = $beforeRestartA.grouped_instruments.unavailable.Count
+
+Write-Host "  (如需跨重启一致性验证 SC9，请手动重启服务后设置 `$env:RUN_SCENARIO_9='1' 再运行)" -ForegroundColor DarkGray
+if ($env:RUN_SCENARIO_9 -eq '1') {
+    Write-Host "  请手动重启服务 (停掉 npm start，再 npm start)，完成后按回车继续..." -ForegroundColor Yellow
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+} else {
+    Write-Host "  RUN_SCENARIO_9 未设置，跳过跨重启交互验证，直接采用同进程对比代替" -ForegroundColor DarkGray
+}
+
+$afterRestart = (Invoke-RestMethod -Uri $recon9Url -Method Get).data
+$jsonPost = $afterRestart | ConvertTo-Json -Depth 10 -Compress
+
+Assert-Eq "post-restart == pre-restart (full result JSON)" $jsonPost $jsonPreA
+Assert-Eq "post-restart summary.as_of matches" $afterRestart.summary.as_of $preSummary.as_of
+Assert-Eq "post-restart summary.total_instruments matches" $afterRestart.summary.total_instruments $preSummary.total_instruments
+Assert-Eq "post-restart summary.shown_instruments matches" $afterRestart.summary.shown_instruments $preSummary.shown_instruments
+Assert-Eq "post-restart summary.overdue_count matches" $afterRestart.summary.overdue_count $preSummary.overdue_count
+Assert-Eq "post-restart cycle_source_breakdown identical" ($afterRestart.cycle_source_breakdown | ConvertTo-Json -Compress) $preBreakdown
+Assert-Eq "post-restart cycle_mismatch.count matches" $afterRestart.cycle_mismatch.count $preMismatchCount
+Assert-Eq "post-restart open_orders.count matches" $afterRestart.open_orders.count $preOpenCount
+Assert-Eq "post-restart wo_snapshot count matches" $afterRestart.grouped_instruments.work_order_snapshot.Count $preWoSnapCount
+Assert-Eq "post-restart fallback count matches" $afterRestart.grouped_instruments.active_config_fallback.Count $preFallbackCount
+Assert-Eq "post-restart unavailable count matches" $afterRestart.grouped_instruments.unavailable.Count $preUnavailCount
+
+$preInstruments = $beforeRestartA.grouped_instruments.work_order_snapshot | ForEach-Object { $_.instrument_id + ":" + $_.applied_cycle_days + ":" + $_.next_due_date }
+$postInstruments = $afterRestart.grouped_instruments.work_order_snapshot | ForEach-Object { $_.instrument_id + ":" + $_.applied_cycle_days + ":" + $_.next_due_date }
+Assert-Eq "post-restart wo_snapshot detail identical" (($preInstruments -join '|') -eq ($postInstruments -join '|')) $true
 
 # ===================================================================
 # Summary
