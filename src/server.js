@@ -29,6 +29,8 @@ app.get('/', (req, res) => {
       technicians: '/api/technicians',
       workOrders: '/api/work-orders',
       overdue: '/api/overdue',
+      overdueExplain: '/api/overdue/explain',
+      overdueExplainByInstrument: '/api/overdue/explain/:instrumentId',
       audit: '/api/audit',
       dataExport: '/api/data/export',
       dataImport: '/api/data/import'

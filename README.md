@@ -10,7 +10,7 @@
 | 校准周期配置 | `/api/configs` | 版本化配置，历史留痕，修改只影响后续工单 |
 | 技师排班 | `/api/technicians` | 技师管理 + datetime 排班，冲突检测 |
 | 校准工单 | `/api/work-orders` | 创建→指派→完成→复核 / 退回重开，状态机严格校验 |
-| 逾期清单 | `/api/overdue` | 基于配置周期计算逾期，结果重启后可复现 |
+| 逾期清单 | `/api/overdue` | 基于配置周期计算逾期，结果重启后可复现；`/explain` 接口提供完整规则追溯 |
 | 审计事件 | `/api/audit` | 全量操作留痕，按实体/时间查询 |
 | 数据导入导出 | `/api/data` | JSON 全量导出/导入，含校验（负数周期拦截） |
 
@@ -111,8 +111,114 @@ SQLite 数据库文件：`data/calibration.db`（首次启动自动创建）。
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/overdue` | 逾期清单（`?as_of=2026-06-12` 指定基准日期） |
+| GET | `/api/overdue/explain` | 逾期规则追溯（完整解释每条结果按哪条规则算出） |
+| GET | `/api/overdue/explain/:instrumentId` | 单仪器逾期规则追溯 |
 
 > 计算逻辑：对每个活跃仪器，取最近 verified 工单的 verified_date + cycle_days_snapshot，若超过基准日期则标记逾期。
+
+#### 逾期规则追溯 (`/api/overdue/explain`)
+
+**查询参数**：
+
+| 参数 | 说明 |
+|---|---|
+| `as_of` | 基准日期，默认今天 |
+| `instrument_id` | 筛选指定仪器 |
+| `include_non_overdue` | `true` 时返回所有仪器（含未逾期的），默认只返回逾期或有未完成工单的 |
+
+**返回结构**（每条记录）：
+
+```json
+{
+  "instrument_id": "uuid",
+  "instrument_name": "Pressure Gauge A",
+  "serial_number": "SN-001",
+  "base_calculation": {
+    "next_due_date": "2026-07-12",
+    "last_calibrated_date": "2026-06-12",
+    "applied_cycle_days": 30,
+    "as_of": "2026-08-01",
+    "is_overdue": true,
+    "days_overdue": 20
+  },
+  "trace": {
+    "cycle_source": "work_order_snapshot",
+    "cycle_source_readable": "最近一次已复核工单的 cycle_days 快照",
+    "work_order": {
+      "id": "uuid",
+      "status": "verified",
+      "verified_date": "2026-06-12T10:00:00.000Z",
+      "completed_date": "2026-06-12T09:00:00.000Z",
+      "cycle_days_snapshot": 30,
+      "config_id_snapshot": "cfg-uuid",
+      "config_version_snapshot": 1,
+      "returned_count_before_verify": 0,
+      "verified_by": "QA Manager"
+    },
+    "snapshot_config": {
+      "id": "cfg-uuid",
+      "version": 1,
+      "cycle_days": 30,
+      "is_active_now": false,
+      "note": "该配置已被新版本替代，仅用于追溯历史计算依据"
+    },
+    "active_config_now": {
+      "id": "cfg-v2-uuid",
+      "version": 2,
+      "cycle_days": 60,
+      "version_diff_note": "当前活跃配置版本已更新为 v2(cycle=60天)，但历史计算仍按工单快照执行"
+    },
+    "reason": {
+      "code": "USING_LAST_VERIFIED_WORK_ORDER",
+      "message": "基于最近一次复核通过的工单（uuid）按快照周期 30 天计算：2026-06-12 + 30天 = 2026-07-12",
+      "fallback_used": false
+    },
+    "audit_event_ids": {
+      "work_order_create": 15,
+      "work_order_verify": 18,
+      "snapshot_config_create": 12,
+      "related_all": [12, 15, 16, 18, 20]
+    },
+    "import_info": {
+      "is_imported": false,
+      "evidence": "SYSTEM_CREATED",
+      "related_audit_id": null,
+      "data_integrity": "工单 ID(uuid)、配置 ID(uuid) 均为导入时保留的原始 ID，追溯链接保持完整"
+    }
+  },
+  "open_work_order": null
+}
+```
+
+**`cycle_source` 取值说明**：
+
+| cycle_source | 含义 | reason.code |
+|---|---|---|
+| `work_order_snapshot` | 基于最近已复核工单的快照周期计算 | `USING_LAST_VERIFIED_WORK_ORDER` |
+| `active_config_fallback` | 无已复核工单，走活跃配置兜底 | `NO_WORK_ORDERS_AT_ALL` / `ONLY_OPEN_ORDERS` / `NO_VERIFIED_ORDER` |
+| `unavailable` | 无活跃配置，无法计算 | `NO_ACTIVE_CONFIG` |
+
+**`import_info.evidence` 取值说明**：
+
+| evidence | 含义 |
+|---|---|
+| `SYSTEM_CREATED` | 系统正常创建（非导入） |
+| `ENTITY_IMPORT_AUDIT` | 有 ENTITY_IMPORT 审计事件直接证明为导入数据 |
+| `SYSTEM_IMPORT_PROXIMITY` | 无直接 ENTITY_IMPORT 事件，但创建时间与系统 IMPORT 事件吻合 |
+
+**边界例子**：
+
+1. **配置版本切换**：仪器有 v1(30天) 已复核工单，之后配置改为 v2(60天)。explain 的 `applied_cycle_days` 仍为 30（快照），`active_config_now.cycle_days=60` 仅做参考展示，不参与计算。
+
+2. **退回重开**：工单创建时快照 cycle=14，期间配置切换到 21 天，工单退回后重新完成并复核。explain 的 `returned_count_before_verify=1`，`applied_cycle_days=14`（仍按创建时的快照）。
+
+3. **打开工单 + 历史复核**：仪器有已复核工单 WO-1，同时存在未完成工单 WO-2。explain 的 `trace.work_order` 指向 WO-1（已复核），`open_work_order` 指向 WO-2 并标注"未参与计算"。
+
+4. **无历史复核**：从未创建工单 -> reason.code=`NO_WORK_ORDERS_AT_ALL`；有工单但未复核 -> reason.code=`ONLY_OPEN_ORDERS`。两者均走 `active_config_fallback`，按 `instrument.created_at + active_config.cycle_days` 计算。
+
+5. **导出再导入**：导入后每个实体自动追加 `ENTITY_IMPORT` 审计事件。explain 的 `import_info.is_imported=true`，`work_order.id` 和 `config_id_snapshot` 保持原值，追溯链路完整。
+
+6. **服务重启**：explain 完全基于数据库实时查询计算，无缓存状态，重启后结果不变。多次查询结果完全一致（确定性验证）。
 
 ### 审计事件
 
@@ -196,6 +302,12 @@ Invoke-RestMethod -Uri http://localhost:3000/api/work-orders/WO_ID/verify -Metho
 
 # 查询逾期
 Invoke-RestMethod -Uri http://localhost:3000/api/overdue
+
+# 查询逾期规则追溯（完整解释）
+Invoke-RestMethod -Uri "http://localhost:3000/api/overdue/explain?as_of=2026-08-01"
+
+# 查询单仪器逾期追溯
+Invoke-RestMethod -Uri "http://localhost:3000/api/overdue/explain/INST_ID?as_of=2026-08-01"
 
 # 导出
 Invoke-RestMethod -Uri http://localhost:3000/api/data/export

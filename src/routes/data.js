@@ -1,9 +1,24 @@
 const express = require('express');
 const { queryAll, run, runInTransaction } = require('../dbHelper');
+const { getDb } = require('../db');
 const { recordAudit } = require('../audit');
 const { AppError } = require('../middleware/errorHandler');
 
 const router = express.Router();
+
+function insertEntityImportAudit(entityType, entityId, extra = {}) {
+  const db = getDb();
+  try {
+    db.run(
+      `INSERT INTO audit_events (event_type, entity_type, entity_id, old_values, new_values, operator, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ['ENTITY_IMPORT', entityType, entityId, null,
+        JSON.stringify({ import_source: 'full_data_import', ...extra }),
+        'import_job', new Date().toISOString()]
+    );
+  } catch (_) {
+  }
+}
 
 router.get('/export', (req, res) => {
   const instruments = queryAll('SELECT * FROM instruments');
@@ -16,6 +31,7 @@ router.get('/export', (req, res) => {
   const exportData = {
     export_version: 1,
     exported_at: new Date().toISOString(),
+    export_trace_hint: '导出数据中各实体 ID 与导入时保持一致；audit_events 自增 ID 在导入后重新生成，但可通过 (entity_type, entity_id, event_type, timestamp) 定位对应事件',
     instruments,
     calibration_configs: configs,
     technicians,
@@ -58,12 +74,13 @@ router.post('/import', (req, res) => {
   }
 
   const result = {
-    instruments: { created: 0, skipped: 0 },
-    calibration_configs: { created: 0, skipped: 0 },
-    technicians: { created: 0, skipped: 0 },
+    instruments: { created: 0, skipped: 0, import_audit_emitted: 0 },
+    calibration_configs: { created: 0, skipped: 0, import_audit_emitted: 0 },
+    technicians: { created: 0, skipped: 0, import_audit_emitted: 0 },
     technician_schedules: { created: 0, skipped: 0 },
-    work_orders: { created: 0, skipped: 0 },
-    audit_events: { created: 0 }
+    work_orders: { created: 0, skipped: 0, import_audit_emitted: 0 },
+    audit_events: { created: 0, note: '原始 audit_events 重新插入，自增 ID 重新生成；另为每个导入实体追加 ENTITY_IMPORT 审计事件用于追溯' },
+    entity_import_audits: { created: 0 }
   };
 
   runInTransaction(() => {
@@ -76,6 +93,9 @@ router.post('/import', (req, res) => {
             inst.created_at || new Date().toISOString(), inst.updated_at || new Date().toISOString()]);
         result.instruments.created++;
       } catch { result.instruments.skipped++; }
+      insertEntityImportAudit('instrument', inst.id, { serial_number: inst.serial_number });
+      result.entity_import_audits.created++;
+      result.instruments.import_audit_emitted++;
     }
 
     for (const cfg of (data.calibration_configs || [])) {
@@ -87,6 +107,9 @@ router.post('/import', (req, res) => {
             cfg.effective_from || new Date().toISOString(), cfg.created_at || new Date().toISOString()]);
         result.calibration_configs.created++;
       } catch { result.calibration_configs.skipped++; }
+      insertEntityImportAudit('calibration_config', cfg.id, { instrument_id: cfg.instrument_id, version: cfg.version });
+      result.entity_import_audits.created++;
+      result.calibration_configs.import_audit_emitted++;
     }
 
     for (const tech of (data.technicians || [])) {
@@ -98,6 +121,9 @@ router.post('/import', (req, res) => {
             tech.created_at || new Date().toISOString(), tech.updated_at || new Date().toISOString()]);
         result.technicians.created++;
       } catch { result.technicians.skipped++; }
+      insertEntityImportAudit('technician', tech.id, { employee_id: tech.employee_id });
+      result.entity_import_audits.created++;
+      result.technicians.import_audit_emitted++;
     }
 
     for (const sch of (data.technician_schedules || [])) {
@@ -124,6 +150,9 @@ router.post('/import', (req, res) => {
             wo.created_at || new Date().toISOString(), wo.updated_at || new Date().toISOString()]);
         result.work_orders.created++;
       } catch { result.work_orders.skipped++; }
+      insertEntityImportAudit('work_order', wo.id, { instrument_id: wo.instrument_id, status: wo.status, config_id: wo.config_id });
+      result.entity_import_audits.created++;
+      result.work_orders.import_audit_emitted++;
     }
 
     for (const ae of (data.audit_events || [])) {
@@ -136,7 +165,14 @@ router.post('/import', (req, res) => {
       result.audit_events.created++;
     }
 
-    recordAudit('IMPORT', 'system', 'full_import', null, { result });
+    const db = getDb();
+    db.run(
+      `INSERT INTO audit_events (event_type, entity_type, entity_id, old_values, new_values, operator, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ['IMPORT', 'system', 'full_import', null,
+        JSON.stringify({ result, traceability_note: '导入实体有 ENTITY_IMPORT 审计事件可追溯；原 audit_events 内容保留但自增ID重新分配' }),
+        'system', new Date().toISOString()]
+    );
   });
 
   res.json({ data: result });

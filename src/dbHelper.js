@@ -1,5 +1,7 @@
 const { getDb, saveToFile } = require('./db');
 
+let _inTransaction = false;
+
 function queryAll(sql, params = []) {
   const db = getDb();
   const stmt = db.prepare(sql);
@@ -29,19 +31,24 @@ function run(sql, params = []) {
   db.run(sql, safeParams);
   const changes = db.getRowsModified();
   const lastInsertRowId = queryOne('SELECT last_insert_rowid() as id').id;
-  saveToFile();
+  if (!_inTransaction) {
+    saveToFile();
+  }
   return { changes, lastInsertRowId };
 }
 
 function runInTransaction(fn) {
   const db = getDb();
   db.run('BEGIN TRANSACTION');
+  _inTransaction = true;
   try {
     const result = fn();
     db.run('COMMIT');
+    _inTransaction = false;
     saveToFile();
     return result;
   } catch (e) {
+    _inTransaction = false;
     try { db.run('ROLLBACK'); } catch (_) {}
     throw e;
   }
