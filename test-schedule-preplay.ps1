@@ -319,7 +319,7 @@ Test-Success "SC7 Preplay returns matched shifts, config snapshot, next_due_date
 # SC8: Preplay result stable across repeated calls (deterministic)
 # ============================================================
 
-Test-Success "SC8 Preplay is deterministic (3 calls, same result)" {
+Test-Success "SC8 Preplay is deterministic (3 calls, identical full response)" {
     $instBody = @{ name = "SP-Inst8-$runId"; serial_number = "SP-SN8-$runId" } | ConvertTo-Json
     $inst8 = Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $instBody -ContentType "application/json"
     $script:inst8Id = $inst8.data.id
@@ -337,16 +337,13 @@ Test-Success "SC8 Preplay is deterministic (3 calls, same result)" {
     $r2 = Invoke-RestMethod -Uri "$base/schedule/preplay" -Method Post -Body $body -ContentType "application/json"
     $r3 = Invoke-RestMethod -Uri "$base/schedule/preplay" -Method Post -Body $body -ContentType "application/json"
 
-    $j1 = $r1.data | ConvertTo-Json -Compress
-    $j2 = $r2.data | ConvertTo-Json -Compress
-    $j3 = $r3.data | ConvertTo-Json -Compress
+    $j1 = $r1.data | ConvertTo-Json -Compress -Depth 10
+    $j2 = $r2.data | ConvertTo-Json -Compress -Depth 10
+    $j3 = $r3.data | ConvertTo-Json -Compress -Depth 10
 
-    $j1compare = $j1 -replace '"validated_at":"[^"]*"', ''
-    $j2compare = $j2 -replace '"validated_at":"[^"]*"', ''
-    $j3compare = $j3 -replace '"validated_at":"[^"]*"', ''
-
-    if ($j1compare -ne $j2compare -or $j2compare -ne $j3compare) { throw "Preplay results not deterministic" }
-    Write-Host "  3 calls produce identical results (excluding validated_at)"
+    if ($j1 -ne $j2 -or $j2 -ne $j3) { throw "Preplay results not deterministic: r1=$j1 r2=$j2" }
+    if ($r1.data.validated_at) { throw "validated_at should not exist in preplay response (breaks determinism)" }
+    Write-Host "  3 calls produce identical full JSON responses (no validated_at field)"
 }
 
 # ============================================================
@@ -515,6 +512,52 @@ Test-Success "SC14 Full schedule flow: confirm -> complete -> verify -> check ov
     $explainR = Invoke-RestMethod -Uri "$base/overdue/explain/${script:inst14Id}?as_of=${asOf}" -Method Get
     if ($explainR.data.base_calculation.is_overdue -ne $true) { throw "should be overdue 30 days out with 7-day cycle" }
     Write-Host "  overdue after 30 days (7-day cycle): is_overdue=$($explainR.data.base_calculation.is_overdue), days_overdue=$($explainR.data.base_calculation.days_overdue)"
+}
+
+# ============================================================
+# SC15: Cross-restart stability (preplay result identical after restart)
+# ============================================================
+
+$restartFixturePath = Join-Path $PSScriptRoot "test-schedule-preplay-restart.json"
+
+if ($env:RUN_SCENARIO_RESTART -eq '1') {
+    Test-Success "SC15 Post-restart: same preplay request produces same full response" {
+        if (-not (Test-Path $restartFixturePath)) { throw "Restart fixture file not found: $restartFixturePath. Run without RUN_SCENARIO_RESTART first." }
+        $fixture = Get-Content $restartFixturePath -Raw | ConvertFrom-Json -Depth 10
+
+        $body = $fixture.request_body | ConvertTo-Json -Compress -Depth 10
+        $r = Invoke-RestMethod -Uri "$base/schedule/preplay" -Method Post -Body $body -ContentType "application/json"
+
+        $jActual = $r.data | ConvertTo-Json -Compress -Depth 10
+        $jExpected = $fixture.response_data | ConvertTo-Json -Compress -Depth 10
+
+        if ($jActual -ne $jExpected) {
+            Write-Host "  expected: $jExpected"
+            Write-Host "  actual:   $jActual"
+            throw "Preplay response changed after restart!"
+        }
+        if ($r.data.validated_at) { throw "validated_at should not exist in preplay response" }
+        Write-Host "  pre-restart == post-restart (full response byte-level identical)"
+    }
+} else {
+    Test-Success "SC15 Pre-restart: record preplay state for restart test" {
+        $body = @{
+            instrument_id = $script:inst1Id
+            technician_id = $script:tech1Id
+            scheduled_start = (Get-Date).AddDays(7).Date.AddHours(10).ToString("yyyy-MM-ddTHH:mm:ss")
+            scheduled_end = (Get-Date).AddDays(7).Date.AddHours(12).ToString("yyyy-MM-ddTHH:mm:ss")
+        }
+
+        $r = Invoke-RestMethod -Uri "$base/schedule/preplay" -Method Post -Body ($body | ConvertTo-Json) -ContentType "application/json"
+
+        $fixture = @{
+            request_body = $body
+            response_data = $r.data
+        }
+        $fixture | ConvertTo-Json -Depth 10 | Set-Content $restartFixturePath
+        Write-Host "  saved pre-restart preplay response to $restartFixturePath"
+        Write-Host "  (Set RUN_SCENARIO_RESTART='1' 后重启服务再运行本脚本验证跨重启一致性"
+    }
 }
 
 # ============================================================

@@ -10,7 +10,6 @@ const router = express.Router();
 function buildPreplayResponse(params) {
   const { instrument_id, technician_id, scheduled_start, scheduled_end } = params;
   const errors = [];
-  const now = new Date().toISOString();
 
   if (!instrument_id) errors.push({ code: 'VALIDATION_ERROR', message: 'instrument_id is required', field: 'instrument_id' });
   if (!technician_id) errors.push({ code: 'VALIDATION_ERROR', message: 'technician_id is required', field: 'technician_id' });
@@ -18,18 +17,18 @@ function buildPreplayResponse(params) {
   if (!scheduled_end) errors.push({ code: 'VALIDATION_ERROR', message: 'scheduled_end is required', field: 'scheduled_end' });
 
   if (errors.length > 0) {
-    return { can_schedule: false, matched_shifts: [], conflict_orders: [], active_config_snapshot: null, next_due_date: null, next_due_date_calc: null, existing_open_order: null, errors, validated_at: now };
+    return { can_schedule: false, matched_shifts: [], conflict_orders: [], active_config_snapshot: null, next_due_date: null, next_due_date_calc: null, existing_open_order: null, errors };
   }
 
   const sStart = new Date(scheduled_start);
   const sEnd = new Date(scheduled_end);
   if (isNaN(sStart.getTime()) || isNaN(sEnd.getTime())) {
     errors.push({ code: 'INVALID_DATETIME', message: 'scheduled_start and scheduled_end must be valid ISO datetime strings' });
-    return { can_schedule: false, matched_shifts: [], conflict_orders: [], active_config_snapshot: null, next_due_date: null, next_due_date_calc: null, existing_open_order: null, errors, validated_at: now };
+    return { can_schedule: false, matched_shifts: [], conflict_orders: [], active_config_snapshot: null, next_due_date: null, next_due_date_calc: null, existing_open_order: null, errors };
   }
   if (sStart >= sEnd) {
     errors.push({ code: 'INVALID_TIME_RANGE', message: 'scheduled_start must be before scheduled_end' });
-    return { can_schedule: false, matched_shifts: [], conflict_orders: [], active_config_snapshot: null, next_due_date: null, next_due_date_calc: null, existing_open_order: null, errors, validated_at: now };
+    return { can_schedule: false, matched_shifts: [], conflict_orders: [], active_config_snapshot: null, next_due_date: null, next_due_date_calc: null, existing_open_order: null, errors };
   }
 
   const inst = queryOne('SELECT * FROM instruments WHERE id = ?', [instrument_id]);
@@ -124,8 +123,7 @@ function buildPreplayResponse(params) {
     next_due_date: nextDueDate,
     next_due_date_calc: nextDueDateCalc,
     existing_open_order: existingOpenOrder,
-    errors: errors.length > 0 ? errors : undefined,
-    validated_at: now
+    errors: errors.length > 0 ? errors : undefined
   };
 }
 

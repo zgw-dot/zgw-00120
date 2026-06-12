@@ -142,8 +142,7 @@ SQLite 数据库文件：`data/calibration.db`（首次启动自动创建）。
       "is_overdue": false,
       "days_overdue": 0
     },
-    "existing_open_order": null,
-    "validated_at": "2026-06-12T10:00:00.000Z"
+    "existing_open_order": null
   }
 }
 ```
@@ -162,8 +161,7 @@ SQLite 数据库文件：`data/calibration.db`（首次启动自动创建）。
     "existing_open_order": null,
     "errors": [
       { "code": "NO_ACTIVE_CONFIG", "message": "No active calibration config for instrument: uuid. Please create a config first." }
-    ],
-    "validated_at": "2026-06-12T10:00:00.000Z"
+    ]
   }
 }
 ```
@@ -215,8 +213,8 @@ SQLite 数据库文件：`data/calibration.db`（首次启动自动创建）。
 ```
 
 > **预演 vs 确认的关键区别**：
-> - 预演是只读操作，**不落库**，可反复调用，结果稳定（纯 DB 状态计算）
-> - 确认会**真正创建工单并指派**，写 `CREATE` + `SCHEDULE_CONFIRM` 审计事件，包含操作者和配置快照
+> - 预演是只读操作，**不落库**，结果完全由请求参数 + 数据库状态决定，**同一请求反复调用结果字节级一致**，跨重启后也稳定
+> - 确认会**真正创建工单并指派**，写 `CREATE` + `SCHEDULE_CONFIRM` 审计事件，包含操作者和配置快照，`confirmed_at` 为真实落库时间
 > - 确认会重新执行完整校验，不依赖预演结果，确保数据一致性
 > - 如果仪器已有 `created` 工单，确认只做指派（`is_new_order=false`）；否则创建 + 指派一步完成
 
