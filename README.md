@@ -541,6 +541,149 @@ pwsh -ExecutionPolicy Bypass -File .\test-overdue-reconciliation.ps1
 | GET | `/api/data/export` | 全量 JSON 导出（默认普通模式，加 `?stable=true` 为稳定模式） |
 | POST | `/api/data/import` | 全量 JSON 导入（自动识别普通包/稳定包，含负数周期等校验） |
 
+#### 稳定迁移包 (Stable Migration Package)
+
+稳定导出用于数据迁移、对账校验、重复比对。导出的完整 JSON 响应可原样提交到导入接口，无需手动剥 `data`。
+
+**核心特性：**
+- 相同数据库快照产生字节级一致的输出
+- 包含 SHA-256 内容哈希，用于导入前后对账
+- 导入端同时兼容完整响应格式（`{ data: ... }`）和直接数据格式
+- 非法配置整包拒绝，不写入任何数据
+- 重复 ID 自动跳过并在结果中列出，不覆盖已有记录
+- 完整审计追踪：IMPORT、ENTITY_IMPORT、IMPORT_VALIDATION_FAILED
+- 导入后逾期 explain / reconciliation 可追溯
+
+#### curl 示例 (bash)
+
+**1. 稳定导出并保存到文件**
+
+```bash
+# 导出稳定包
+curl -s "http://localhost:3000/api/data/export?stable=true" -o stable-package.json
+
+# 查看包大小和哈希
+python3 -c "import json; d=json.load(open('stable-package.json'))['data']; print(f\"entities: {d['manifest']['entity_counts']}\"); print(f\"hash: {d['manifest']['content_hash']}\")"
+```
+
+**2. 完整响应原样导入（无需手动剥 data）**
+
+```bash
+# 直接把导出的文件导入（完整响应格式，带 data 包装）
+curl -s -X POST "http://localhost:3000/api/data/import" \
+  -H 'Content-Type: application/json' \
+  --data-binary @stable-package.json | python3 -m json.tool
+```
+
+**3. 验证导入后哈希（对账）**
+
+```bash
+# 导入后再次导出，对比哈希
+curl -s "http://localhost:3000/api/data/export?stable=true" -o after-import.json
+
+# 对比哈希（Python 一行）
+python3 -c "
+import json
+before = json.load(open('stable-package.json'))['data']['manifest']['content_hash']
+after = json.load(open('after-import.json'))['data']['manifest']['content_hash']
+print(f'Before import hash: {before}')
+print(f'After import hash:  {after}')
+print(f'Match: {before == after}')
+"
+```
+
+**4. 直接数据格式导入（旧格式兼容）**
+
+```bash
+# 剥掉 data 包装，只传数据部分
+python3 -c "import json; print(json.dumps(json.load(open('stable-package.json'))['data']))" > data-only.json
+
+# 导入直接格式（旧版兼容）
+curl -s -X POST "http://localhost:3000/api/data/import" \
+  -H 'Content-Type: application/json' \
+  --data-binary @data-only.json | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+print(f\"wrapper_format: {r['data']['wrapper_format']}\")
+print(f\"import_mode: {r['data']['import_mode']}\")
+"
+```
+
+**5. 负数周期整包拒绝（验证校验）**
+
+```bash
+# 构造非法数据（负数周期）
+echo '{
+  "instruments": [{"id": "test-neg", "name": "Test", "serial_number": "NEG-001"}],
+  "calibration_configs": [{"id": "cfg-neg", "instrument_id": "test-neg", "cycle_days": -10, "version": 1}]
+}' > bad-data.json
+
+# 尝试导入（应返回 400 错误，整包拒绝）
+curl -s -w "\nHTTP_STATUS: %{http_code}\n" -X POST "http://localhost:3000/api/data/import" \
+  -H 'Content-Type: application/json' \
+  --data-binary @bad-data.json
+```
+
+**6. 查询导入审计事件**
+
+```bash
+# 查看系统级 IMPORT 事件
+curl -s "http://localhost:3000/api/audit?event_type=IMPORT&limit=5" | python3 -m json.tool
+
+# 查看实体级 ENTITY_IMPORT 事件（含导入状态）
+curl -s "http://localhost:3000/api/audit?event_type=ENTITY_IMPORT&limit=10" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)['data']
+for ev in data[:5]:
+    status = ev.get('new_values', {}).get('import_status', 'N/A') if ev.get('new_values') else 'N/A'
+    print(f\"{ev['id']}: {ev['entity_type']}/{ev['entity_id']} -> {status}\")
+"
+
+# 查看校验失败事件
+curl -s "http://localhost:3000/api/audit?event_type=IMPORT_VALIDATION_FAILED&limit=3" | python3 -m json.tool
+```
+
+#### PowerShell 示例
+
+**1. 稳定导出并导入（字节级往返）**
+
+```powershell
+$base = "http://localhost:3000/api"
+$webClient = New-Object System.Net.WebClient
+
+# 导出稳定包（字节级，确保编码正确）
+$rawBytes = $webClient.DownloadData("$base/data/export?stable=true")
+Write-Host "Export size: $($rawBytes.Length) bytes"
+
+# 保存到文件
+[System.IO.File]::WriteAllBytes("stable-package.json", $rawBytes)
+
+# 查看哈希
+$pkg = [System.Text.Encoding]::UTF8.GetString($rawBytes) | ConvertFrom-Json
+Write-Host "Content hash: $($pkg.data.manifest.content_hash)"
+Write-Host "Entity counts: $($pkg.data.manifest.entity_counts | ConvertTo-Json -Compress)"
+
+# 完整响应原样导入
+$webClient.Headers.Add("Content-Type", "application/json")
+$importBytes = $webClient.UploadData("$base/data/import", "POST", $rawBytes)
+$importResult = [System.Text.Encoding]::UTF8.GetString($importBytes) | ConvertFrom-Json
+
+Write-Host "Import mode: $($importResult.data.import_mode)"
+Write-Host "Wrapper format: $($importResult.data.wrapper_format)"
+Write-Host "Hash verified: $($importResult.data.hash_verification.verified)"
+Write-Host "Instruments created: $($importResult.data.instruments.created)"
+Write-Host "Instruments skipped: $($importResult.data.instruments.skipped)"
+
+$webClient.Dispose()
+```
+
+**2. 运行完整测试脚本**
+
+```powershell
+# 完整稳定迁移测试套件（11 场景，22 个断言）
+powershell -ExecutionPolicy Bypass -File .\test-stable-migration.ps1
+```
+
 #### 普通导出 vs 稳定导出对比
 
 | 维度 | 普通导出（默认） | 稳定导出（`?stable=true`） |
@@ -553,90 +696,29 @@ pwsh -ExecutionPolicy Bypass -File .\test-overdue-reconciliation.ps1
 | 重复调用一致性 | 每次不同（时间戳+审计 ID 变化） | **字节级一致**（数据库快照不变时） |
 | 跨重启一致性 | 不一致 | **完全一致** |
 
-#### 稳定导出查询参数
-
-| 参数 | 类型 | 说明 |
-|---|---|---|
-| `stable` | string | `true` 或 `1` 时启用稳定模式；其他值或省略时为普通模式 |
-
-#### 稳定导出 manifest 字段说明
-
-```json
-{
-  "manifest": {
-    "stable_export_version": 1,
-    "schema_version": "1.0.0",
-    "export_mode": "stable",
-    "entity_counts": {
-      "instruments": 10,
-      "calibration_configs": 12,
-      "technicians": 5,
-      "technician_schedules": 20,
-      "work_orders": 30,
-      "audit_events": 100
-    },
-    "deterministic_guarantee": "same-snapshot-same-bytes: 同一数据库快照(不增删改)下，无论调用多少次、是否重启服务，data 字段字节级完全一致",
-    "ordering_rules": {
-      "instruments": "BY id ASC",
-      "calibration_configs": "BY id ASC",
-      "technicians": "BY id ASC",
-      "technician_schedules": "BY id ASC",
-      "work_orders": "BY id ASC",
-      "audit_events": "BY timestamp ASC, event_type ASC, (entity_type|entity_id) ASC"
-    },
-    "hash_algorithm": "SHA-256",
-    "hash_scope": "manifest(不含content_hash字段) + 全部实体数组(已排序) 的规范化 JSON",
-    "content_hash": "sha256-hex-string..."
-  },
-  "instruments": [...],
-  "calibration_configs": [...],
-  "technicians": [...],
-  "technician_schedules": [...],
-  "work_orders": [...],
-  "audit_events": [...]
-}
-```
-
-| 字段 | 说明 |
-|---|---|
-| `stable_export_version` | 稳定导出格式版本号，用于兼容性判断 |
-| `schema_version` | 数据 schema 版本 |
-| `entity_counts` | 各实体数组长度统计，用于快速校验完整性 |
-| `ordering_rules` | 各实体数组的排序规则说明 |
-| `content_hash` | **SHA-256 哈希值**，由规范化 JSON（键排序、无多余空格）的 manifest（不含自身）+ 全部实体数组计算得到 |
-
-#### 稳定导出限制与注意事项
-
-1. **只读无副作用**：稳定导出不写入任何审计事件，不修改数据库
-2. **哈希范围**：`content_hash` 只覆盖 `data` 字段内容，不包含外层响应包装（如 `{ "data": ... }` 结构）
-3. **排序键**：所有实体按字符串形式的 `id` 排序，而非数值或 UUID 版本号
-4. **审计事件**：因自增 ID 在导入后会重排，稳定导出中的 `audit_events` 按业务键排序（时间戳→事件类型→实体），而非 id 排序
-5. **JSON 规范化**：哈希计算使用键排序的 JSON 序列化，确保不同 JSON 序列化器产生相同输入
-6. **导入兼容**：稳定包可直接用于导入接口，接口自动识别 `manifest` 字段并在结果中返回 `import_mode: "stable_package"`
-
-#### 导入接口增强
-
-导入接口兼容普通包和稳定包，自动识别（通过是否存在 `manifest` 字段）。
-
-**导入结果新增字段**：
+#### 导入结果字段说明
 
 | 字段 | 说明 |
 |---|---|
 | `import_mode` | `"stable_package"` 或 `"legacy_package"` |
-| `manifest_info` | 稳定包时返回，包含原始版本、哈希、计数等元数据 |
-| `*.skipped_ids` | 每种实体（除 audit_events）都有 `skipped_ids` 数组，列出因 ID 冲突而跳过的实体 ID |
-| `*.skipped` | 跳过计数（与 `skipped_ids.length` 一致） |
-| `*.created` | 实际插入计数 |
+| `wrapper_format` | `"full_response"`（完整响应格式）或 `"direct"`（直接数据格式） |
+| `hash_verification` | 稳定包时返回，包含 `verified`、`original_hash`、`computed_hash`、`reason` |
+| `*.created` | 每种实体实际插入数量 |
+| `*.skipped` | 每种实体因 ID 冲突跳过的数量 |
+| `*.skipped_ids` | 每种实体跳过的具体 ID 列表 |
 | `*.import_audit_emitted` | 为该实体类型写入的 `ENTITY_IMPORT` 审计事件数 |
 
-**导入行为保证**：
-- 重复 ID 自动跳过（`INSERT OR IGNORE`），跳过的 ID 写入结果
-- 非法配置（如负数 `cycle_days`）**整体拒绝**，返回 `IMPORT_VALIDATION_FAILED`
-- 每个导入实体（无论新建还是跳过）都有 `ENTITY_IMPORT` 审计事件
-- 导入结束写入系统级 `IMPORT` 审计事件，包含完整结果摘要和跳过 ID 列表
-- 逾期 explain / reconciliation 的 `import_info` 追溯链路保持完整
+#### 限制与注意事项
 
-**导入校验**：负数 `cycle_days` 拦截，返回 `IMPORT_VALIDATION_FAILED` 并附带详细错误列表。
+1. **稳定导出只读**：稳定导出不写入任何审计事件，不修改数据库，无副作用
+2. **导入不覆盖**：重复 ID 使用 `INSERT OR IGNORE` 跳过，不更新已有记录
+3. **整包拒绝**：校验失败（如负数周期）时，不写入任何数据，包含审计事件
+4. **哈希范围**：`content_hash` 覆盖 `data` 字段内的所有内容（manifest + 实体数组），不含外层 `{ "data": ... }` 包装
+5. **审计事件 ID**：导入时 `audit_events` 的自增 ID 会重新生成，不保留原始 ID，但业务键可追溯
+6. **请求体大小限制**：默认 50MB（`express.json` limit）
+7. **幂等性**：同一稳定包多次导入，结果一致（跳过已存在的，新增不存在的）
+8. **编码**：导入导出均使用 UTF-8 编码，使用字节级传输时哈希验证最可靠
+9. **跨服务版本**：稳定包格式版本号（`stable_export_version`）用于兼容性判断
 
 ## 工单状态流转
 

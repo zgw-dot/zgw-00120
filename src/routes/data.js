@@ -166,44 +166,146 @@ router.get('/export', (req, res) => {
   }
 });
 
-router.post('/import', (req, res) => {
-  const data = req.body;
-  if (!data || !data.instruments) {
-    throw new AppError('Invalid import data: instruments array is required', 400, 'INVALID_IMPORT_DATA');
+function unwrapImportData(body) {
+  if (body && typeof body === 'object' && !Array.isArray(body) && body.data && typeof body.data === 'object' && !Array.isArray(body.data)) {
+    return { data: body.data, wrapper: 'full_response' };
+  }
+  return { data: body, wrapper: 'direct' };
+}
+
+function validateImportData(importData) {
+  const errors = [];
+
+  if (!importData || !importData.instruments || !Array.isArray(importData.instruments)) {
+    errors.push({
+      type: 'INVALID_IMPORT_DATA',
+      entity: 'system',
+      id: null,
+      message: 'instruments array is required'
+    });
+    return errors;
   }
 
-  const isStablePackage = !!data.manifest;
-  const manifestInfo = isStablePackage
-    ? {
-      stable_export_version: data.manifest.stable_export_version || null,
-      schema_version: data.manifest.schema_version || null,
-      original_content_hash: data.manifest.content_hash || null,
-      entity_counts: data.manifest.entity_counts || null
-    }
-    : null;
-
-  const validationErrors = [];
-
-  if (data.calibration_configs) {
-    for (const cfg of data.calibration_configs) {
+  if (importData.calibration_configs) {
+    for (const cfg of importData.calibration_configs) {
       if (cfg.cycle_days !== undefined && (!Number.isInteger(cfg.cycle_days) || cfg.cycle_days <= 0)) {
-        validationErrors.push({
+        errors.push({
           type: 'INVALID_CYCLE_DAYS',
           entity: 'calibration_config',
-          id: cfg.id,
-          message: `calibration_config id=${cfg.id} has invalid cycle_days=${cfg.cycle_days} (must be positive integer)`
+          id: cfg.id || null,
+          message: `calibration_config id=${cfg.id || 'unknown'} has invalid cycle_days=${cfg.cycle_days} (must be positive integer)`
         });
       }
     }
   }
 
+  return errors;
+}
+
+function verifyStablePackageHash(importData) {
+  if (!importData.manifest || !importData.manifest.content_hash) {
+    return { verified: false, reason: 'NO_MANIFEST_HASH' };
+  }
+
+  const { content_hash: originalHash, ...manifestWithoutHash } = importData.manifest;
+
+  const entitiesForHash = {};
+  const entityKeys = ['instruments', 'calibration_configs', 'technicians', 'technician_schedules', 'work_orders', 'audit_events'];
+  for (const key of entityKeys) {
+    if (importData[key]) {
+      entitiesForHash[key] = importData[key];
+    }
+  }
+
+  const hashInput = {
+    manifest: manifestWithoutHash,
+    ...entitiesForHash
+  };
+  const computedHash = computeContentHash(hashInput);
+
+  return {
+    verified: computedHash === originalHash,
+    original_hash: originalHash,
+    computed_hash: computedHash,
+    reason: computedHash === originalHash ? 'MATCH' : 'MISMATCH'
+  };
+}
+
+function recordImportValidationAudit(errors, packageInfo) {
+  const db = getDb();
+  try {
+    db.run(
+      `INSERT INTO audit_events (event_type, entity_type, entity_id, old_values, new_values, operator, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ['IMPORT_VALIDATION_FAILED', 'system', 'full_import', null,
+        JSON.stringify({
+          errors,
+          package_info: packageInfo,
+          severity: '整包拒绝',
+          rejection_reason: `${errors.length} 个校验错误`
+        }),
+        'import_job', new Date().toISOString()]
+    );
+  } catch (_) {
+  }
+}
+
+function insertEntityImportAuditWithStatus(entityType, entityId, status, extra = {}) {
+  const db = getDb();
+  try {
+    db.run(
+      `INSERT INTO audit_events (event_type, entity_type, entity_id, old_values, new_values, operator, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ['ENTITY_IMPORT', entityType, entityId, null,
+        JSON.stringify({
+          import_source: 'full_data_import',
+          import_status: status,
+          ...extra
+        }),
+        'import_job', new Date().toISOString()]
+    );
+  } catch (_) {
+  }
+}
+
+router.post('/import', (req, res) => {
+  const { data: importData, wrapper } = unwrapImportData(req.body);
+
+  const isStablePackage = !!(importData && importData.manifest);
+  const packageInfo = {
+    import_mode: isStablePackage ? 'stable_package' : 'legacy_package',
+    wrapper_format: wrapper,
+    manifest_info: isStablePackage
+      ? {
+        stable_export_version: importData.manifest.stable_export_version || null,
+        schema_version: importData.manifest.schema_version || null,
+        original_content_hash: importData.manifest.content_hash || null,
+        entity_counts: importData.manifest.entity_counts || null
+      }
+      : null
+  };
+
+  const validationErrors = validateImportData(importData);
+
   if (validationErrors.length > 0) {
-    throw new AppError(`Import validation failed: ${validationErrors.length} error(s) found`, 400, 'IMPORT_VALIDATION_FAILED', { errors: validationErrors });
+    recordImportValidationAudit(validationErrors, packageInfo);
+    throw new AppError(`Import validation failed: ${validationErrors.length} error(s) found - entire package rejected`, 400, 'IMPORT_VALIDATION_FAILED', {
+      errors: validationErrors,
+      rejection_policy: '整包拒绝：校验失败时不写入任何数据',
+      package_info: packageInfo
+    });
+  }
+
+  let hashVerification = null;
+  if (isStablePackage) {
+    hashVerification = verifyStablePackageHash(importData);
   }
 
   const result = {
     import_mode: isStablePackage ? 'stable_package' : 'legacy_package',
-    manifest_info: manifestInfo,
+    wrapper_format: wrapper,
+    hash_verification: hashVerification,
+    manifest_info: packageInfo.manifest_info,
     instruments: { created: 0, skipped: 0, skipped_ids: [], import_audit_emitted: 0 },
     calibration_configs: { created: 0, skipped: 0, skipped_ids: [], import_audit_emitted: 0 },
     technicians: { created: 0, skipped: 0, skipped_ids: [], import_audit_emitted: 0 },
@@ -213,62 +315,66 @@ router.post('/import', (req, res) => {
       created: 0,
       note: '原始 audit_events 重新插入，自增 ID 重新生成；另为每个导入实体追加 ENTITY_IMPORT 审计事件用于追溯'
     },
-    entity_import_audits: { created: 0 }
+    entity_import_audits: { created: 0 },
+    rejection_policy: '重复 ID 跳过不覆盖，非法配置整包拒绝'
   };
 
   runInTransaction(() => {
-    for (const inst of (data.instruments || [])) {
+    for (const inst of (importData.instruments || [])) {
       const r = run(`INSERT OR IGNORE INTO instruments (id, name, model, serial_number, location, category, status, description, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [inst.id, inst.name, inst.model || '', inst.serial_number, inst.location || '',
           inst.category || '', inst.status || 'active', inst.description || '',
           inst.created_at || new Date().toISOString(), inst.updated_at || new Date().toISOString()]);
+      const status = r.changes > 0 ? 'created' : 'skipped_id_conflict';
       if (r.changes > 0) {
         result.instruments.created++;
       } else {
         result.instruments.skipped++;
         result.instruments.skipped_ids.push(inst.id);
       }
-      insertEntityImportAudit('instrument', inst.id, { serial_number: inst.serial_number });
+      insertEntityImportAuditWithStatus('instrument', inst.id, status, { serial_number: inst.serial_number });
       result.entity_import_audits.created++;
       result.instruments.import_audit_emitted++;
     }
 
-    for (const cfg of (data.calibration_configs || [])) {
+    for (const cfg of (importData.calibration_configs || [])) {
       const r = run(`INSERT OR IGNORE INTO calibration_configs (id, instrument_id, cycle_days, tolerance, standard, version, is_active, effective_from, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [cfg.id, cfg.instrument_id, cfg.cycle_days, cfg.tolerance || '', cfg.standard || '',
           cfg.version || 1, cfg.is_active !== undefined ? cfg.is_active : 1,
           cfg.effective_from || new Date().toISOString(), cfg.created_at || new Date().toISOString()]);
+      const status = r.changes > 0 ? 'created' : 'skipped_id_conflict';
       if (r.changes > 0) {
         result.calibration_configs.created++;
       } else {
         result.calibration_configs.skipped++;
         result.calibration_configs.skipped_ids.push(cfg.id);
       }
-      insertEntityImportAudit('calibration_config', cfg.id, { instrument_id: cfg.instrument_id, version: cfg.version });
+      insertEntityImportAuditWithStatus('calibration_config', cfg.id, status, { instrument_id: cfg.instrument_id, version: cfg.version });
       result.entity_import_audits.created++;
       result.calibration_configs.import_audit_emitted++;
     }
 
-    for (const tech of (data.technicians || [])) {
+    for (const tech of (importData.technicians || [])) {
       const r = run(`INSERT OR IGNORE INTO technicians (id, name, employee_id, title, phone, email, status, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [tech.id, tech.name, tech.employee_id, tech.title || '', tech.phone || '',
           tech.email || '', tech.status || 'active',
           tech.created_at || new Date().toISOString(), tech.updated_at || new Date().toISOString()]);
+      const status = r.changes > 0 ? 'created' : 'skipped_id_conflict';
       if (r.changes > 0) {
         result.technicians.created++;
       } else {
         result.technicians.skipped++;
         result.technicians.skipped_ids.push(tech.id);
       }
-      insertEntityImportAudit('technician', tech.id, { employee_id: tech.employee_id });
+      insertEntityImportAuditWithStatus('technician', tech.id, status, { employee_id: tech.employee_id });
       result.entity_import_audits.created++;
       result.technicians.import_audit_emitted++;
     }
 
-    for (const sch of (data.technician_schedules || [])) {
+    for (const sch of (importData.technician_schedules || [])) {
       const r = run(`INSERT OR IGNORE INTO technician_schedules (id, technician_id, start_time, end_time, shift_type, notes, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [sch.id, sch.technician_id, sch.start_time, sch.end_time,
@@ -281,7 +387,7 @@ router.post('/import', (req, res) => {
       }
     }
 
-    for (const wo of (data.work_orders || [])) {
+    for (const wo of (importData.work_orders || [])) {
       const r = run(`INSERT OR IGNORE INTO work_orders (id, instrument_id, config_id, config_version, cycle_days_snapshot, technician_id, status,
            planned_date, scheduled_start, scheduled_end, assigned_date, completed_date, verified_date, result, deviation, certificate_no, notes, created_by, verified_by, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -292,18 +398,19 @@ router.post('/import', (req, res) => {
           wo.result || '', wo.deviation || '', wo.certificate_no || '', wo.notes || '',
           wo.created_by || 'system', wo.verified_by || '',
           wo.created_at || new Date().toISOString(), wo.updated_at || new Date().toISOString()]);
+      const status = r.changes > 0 ? 'created' : 'skipped_id_conflict';
       if (r.changes > 0) {
         result.work_orders.created++;
       } else {
         result.work_orders.skipped++;
         result.work_orders.skipped_ids.push(wo.id);
       }
-      insertEntityImportAudit('work_order', wo.id, { instrument_id: wo.instrument_id, status: wo.status, config_id: wo.config_id });
+      insertEntityImportAuditWithStatus('work_order', wo.id, status, { instrument_id: wo.instrument_id, status: wo.status, config_id: wo.config_id });
       result.entity_import_audits.created++;
       result.work_orders.import_audit_emitted++;
     }
 
-    for (const ae of (data.audit_events || [])) {
+    for (const ae of (importData.audit_events || [])) {
       run(`INSERT INTO audit_events (event_type, entity_type, entity_id, old_values, new_values, operator, timestamp)
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [ae.event_type, ae.entity_type, ae.entity_id,
@@ -320,7 +427,8 @@ router.post('/import', (req, res) => {
       ['IMPORT', 'system', 'full_import', null,
         JSON.stringify({
           result,
-          traceability_note: '导入实体有 ENTITY_IMPORT 审计事件可追溯；原 audit_events 内容保留但自增ID重新分配；skipped_ids 字段列出因 ID 冲突而跳过的实体'
+          hash_verification: hashVerification,
+          traceability_note: '导入实体有 ENTITY_IMPORT 审计事件可追溯；原 audit_events 内容保留但自增ID重新分配；skipped_ids 字段列出因 ID 冲突而跳过的实体；ENTITY_IMPORT 事件的 import_status 字段标明 created 或 skipped_id_conflict'
         }),
         'system', new Date().toISOString()]
     );
