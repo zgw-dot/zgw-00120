@@ -9,6 +9,7 @@ const instrumentsRouter = require('./routes/instruments');
 const configsRouter = require('./routes/configs');
 const techniciansRouter = require('./routes/technicians');
 const workOrdersRouter = require('./routes/workorders');
+const scheduleRouter = require('./routes/schedule');
 const overdueRouter = require('./routes/overdue');
 const auditRouter = require('./routes/audit');
 const dataRouter = require('./routes/data');
@@ -28,6 +29,8 @@ app.get('/', (req, res) => {
       configs: '/api/configs',
       technicians: '/api/technicians',
       workOrders: '/api/work-orders',
+      schedulePreplay: '/api/schedule/preplay',
+      scheduleConfirm: '/api/schedule/confirm',
       overdue: '/api/overdue',
       overdueExplain: '/api/overdue/explain',
       overdueExplainByInstrument: '/api/overdue/explain/:instrumentId',
@@ -47,6 +50,7 @@ app.use('/api/instruments', instrumentsRouter);
 app.use('/api/configs', configsRouter);
 app.use('/api/technicians', techniciansRouter);
 app.use('/api/work-orders', workOrdersRouter);
+app.use('/api/schedule', scheduleRouter);
 app.use('/api/overdue', overdueRouter);
 app.use('/api/audit', auditRouter);
 app.use('/api/data', dataRouter);

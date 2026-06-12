@@ -10,6 +10,7 @@
 | 校准周期配置 | `/api/configs` | 版本化配置，历史留痕，修改只影响后续工单 |
 | 技师排班 | `/api/technicians` | 技师管理 + datetime 排班，冲突检测 |
 | 校准工单 | `/api/work-orders` | 创建→指派→完成→复核 / 退回重开，状态机严格校验 |
+| 排期预演/确认 | `/api/schedule` | 预演检查可排性（不落库）；确认落库并写审计事件 |
 | 逾期清单 | `/api/overdue` | 基于配置周期计算逾期，结果重启后可复现；`/explain` 接口提供完整规则追溯；`/reconciliation` 提供批量对账视图 |
 | 审计事件 | `/api/audit` | 全量操作留痕，按实体/时间查询 |
 | 数据导入导出 | `/api/data` | JSON 全量导出/导入，含校验（负数周期拦截） |
@@ -105,6 +106,160 @@ SQLite 数据库文件：`data/calibration.db`（首次启动自动创建）。
 **退回工单**：`notes`
 
 **重新指派**：`technician_id`(必填), `scheduled_start`(可选), `scheduled_end`(可选)
+
+### 排期预演/确认
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/schedule/preplay` | 排期预演（只读，不落库） |
+| POST | `/api/schedule/confirm` | 排期确认（创建工单 + 指派，落库并写审计事件） |
+
+**预演请求体**：`instrument_id`(必填), `technician_id`(必填), `scheduled_start`(必填,ISO datetime), `scheduled_end`(必填,ISO datetime)
+
+**预演返回结构**：
+
+```json
+{
+  "data": {
+    "can_schedule": true,
+    "matched_shifts": [
+      { "id": "uuid", "start_time": "...", "end_time": "...", "shift_type": "regular" }
+    ],
+    "conflict_orders": [],
+    "active_config_snapshot": {
+      "id": "cfg-uuid",
+      "version": 1,
+      "cycle_days": 90,
+      "tolerance": "±0.5%",
+      "standard": "ISO-17025",
+      "effective_from": "2026-01-01T00:00:00.000Z"
+    },
+    "next_due_date": "2026-09-12",
+    "next_due_date_calc": {
+      "cycle_source": "active_config_fallback",
+      "applied_cycle_days": 90,
+      "last_calibrated_date": null,
+      "is_overdue": false,
+      "days_overdue": 0
+    },
+    "existing_open_order": null,
+    "validated_at": "2026-06-12T10:00:00.000Z"
+  }
+}
+```
+
+**预演失败示例**（无活跃配置）：
+
+```json
+{
+  "data": {
+    "can_schedule": false,
+    "matched_shifts": [],
+    "conflict_orders": [],
+    "active_config_snapshot": null,
+    "next_due_date": null,
+    "next_due_date_calc": null,
+    "existing_open_order": null,
+    "errors": [
+      { "code": "NO_ACTIVE_CONFIG", "message": "No active calibration config for instrument: uuid. Please create a config first." }
+    ],
+    "validated_at": "2026-06-12T10:00:00.000Z"
+  }
+}
+```
+
+**预演返回字段说明**：
+
+| 字段 | 说明 |
+|---|---|
+| `can_schedule` | `true` 表示可以排期，`false` 表示存在冲突或校验失败 |
+| `matched_shifts` | 覆盖请求时间窗的技师排班列表 |
+| `conflict_orders` | 与请求时间重叠的已有工单列表 |
+| `active_config_snapshot` | 当前活跃校准配置快照 |
+| `next_due_date` | 仪器当前预计下次到期日 |
+| `next_due_date_calc` | 到期日计算明细（来源、周期天数、是否逾期等） |
+| `existing_open_order` | 已存在的 `created` 状态工单（确认时可复用，无需新建） |
+| `errors` | 校验失败原因列表（`can_schedule=false` 时存在） |
+
+**确认请求体**：`instrument_id`(必填), `technician_id`(必填), `scheduled_start`(必填), `scheduled_end`(必填), `operator`(可选,默认 system), `notes`(可选), `created_by`(可选)
+
+**确认返回结构**：
+
+```json
+{
+  "data": {
+    "id": "wo-uuid",
+    "instrument_id": "...",
+    "status": "assigned",
+    "technician_id": "...",
+    "scheduled_start": "2026-07-01T09:00:00",
+    "scheduled_end": "2026-07-01T11:00:00",
+    "config_id": "cfg-uuid",
+    "config_version": 1,
+    "cycle_days_snapshot": 90
+  },
+  "meta": {
+    "config_snapshot": {
+      "config_id": "cfg-uuid",
+      "config_version": 1,
+      "cycle_days": 90,
+      "tolerance": "±0.5%",
+      "standard": "ISO-17025",
+      "effective_from": "2026-01-01T00:00:00.000Z"
+    },
+    "confirmed_by": "admin",
+    "confirmed_at": "2026-06-12T10:00:00.000Z",
+    "is_new_order": true
+  }
+}
+```
+
+> **预演 vs 确认的关键区别**：
+> - 预演是只读操作，**不落库**，可反复调用，结果稳定（纯 DB 状态计算）
+> - 确认会**真正创建工单并指派**，写 `CREATE` + `SCHEDULE_CONFIRM` 审计事件，包含操作者和配置快照
+> - 确认会重新执行完整校验，不依赖预演结果，确保数据一致性
+> - 如果仪器已有 `created` 工单，确认只做指派（`is_new_order=false`）；否则创建 + 指派一步完成
+
+#### 排期预演/确认 curl 示例
+
+```bash
+# 预演：检查能否排期
+curl -s -X POST "http://localhost:3000/api/schedule/preplay" \
+  -H 'Content-Type: application/json' \
+  -d '{"instrument_id":"INST_ID","technician_id":"TECH_ID","scheduled_start":"2026-07-01T09:00:00","scheduled_end":"2026-07-01T11:00:00"}' | python3 -m json.tool
+
+# 确认：落库并写审计事件
+curl -s -X POST "http://localhost:3000/api/schedule/confirm" \
+  -H 'Content-Type: application/json' \
+  -d '{"instrument_id":"INST_ID","technician_id":"TECH_ID","scheduled_start":"2026-07-01T09:00:00","scheduled_end":"2026-07-01T11:00:00","operator":"admin"}' | python3 -m json.tool
+```
+
+#### 排期预演/确认 PowerShell 示例
+
+```powershell
+# 预演
+$preplayBody = @{
+    instrument_id = "INST_ID"
+    technician_id = "TECH_ID"
+    scheduled_start = "2026-07-01T09:00:00"
+    scheduled_end = "2026-07-01T11:00:00"
+} | ConvertTo-Json
+$preplayResult = Invoke-RestMethod -Uri "http://localhost:3000/api/schedule/preplay" -Method Post -Body $preplayBody -ContentType "application/json"
+$preplayResult.data.can_schedule
+
+# 确认
+$confirmBody = @{
+    instrument_id = "INST_ID"
+    technician_id = "TECH_ID"
+    scheduled_start = "2026-07-01T09:00:00"
+    scheduled_end = "2026-07-01T11:00:00"
+    operator = "admin"
+    notes = "Scheduled via pre-play confirmation"
+} | ConvertTo-Json
+$confirmResult = Invoke-RestMethod -Uri "http://localhost:3000/api/schedule/confirm" -Method Post -Body $confirmBody -ContentType "application/json"
+$confirmResult.data.status
+$confirmResult.meta.config_snapshot
+```
 
 ### 逾期清单
 
@@ -411,6 +566,7 @@ created ──assign──> assigned ──complete──> completed ──verif
 | 脚本 | 覆盖范围 | 可重复执行 |
 |---|---|---|
 | `test-acceptance.ps1` | 31 个基础验收场景（CRUD + 状态机 + 冲突检测 + 导出导入） | 是 |
+| `test-schedule-preplay.ps1` | **排期预演/确认端到端**：预演不落库、确认才落库、重叠时间拒绝、无活跃配置/非 active 仪器可读错误、确认后审计可查操作者和快照、导出导入冲突判断不变、逾期对账回归 | 是 |
 | `test-overdue-regression.ps1` | 逾期计算回归：快照周期 vs 活跃配置、导出导入、确定性、失败场景回归 | 是（每次运行用随机 `runId` 生成唯一序列号，避免撞库） |
 | `test-overdue-explain.ps1` | 逾期规则追溯完整链路：配置切换、退回重开、打开工单不混用、活跃配置兜底、导出导入追溯、确定性验证 | 是 |
 | `test-overdue-reconciliation.ps1` | **批量对账视图**：SC1 配置切换 mismatch、SC2 退回重开、SC3 无已复核工单 fallback、SC4 无活跃配置 unavailable、SC5 导出导入分组一致性、SC6 多次查询确定性、SC7 include_non_overdue 参数、SC8 与 /explain 交叉验证、SC9 跨重启完整结果字节级一致性 | 是（**powershell 5.1 / pwsh 双端兼容**，脚本为 UTF-8 BOM 编码；SC9 需手动重启并按回车） |
@@ -420,6 +576,7 @@ created ──assign──> assigned ──complete──> completed ──verif
 npm start
 
 # 另开终端运行测试（可反复执行，不会撞库）
+powershell -ExecutionPolicy Bypass -File .\test-schedule-preplay.ps1
 powershell -ExecutionPolicy Bypass -File .\test-overdue-regression.ps1
 powershell -ExecutionPolicy Bypass -File .\test-overdue-explain.ps1
 # reconciliation 脚本 powershell 5.1 / pwsh 双端均可运行
