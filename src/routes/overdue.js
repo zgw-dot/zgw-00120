@@ -28,15 +28,21 @@ router.get('/', (req, res) => {
     let lastCalibratedDate;
     let daysOverdue = 0;
     let isOverdue = false;
+    let appliedCycleDays;
+    let cycleSource;
 
     if (lastOrder) {
       lastCalibratedDate = lastOrder.verified_date ? lastOrder.verified_date.split('T')[0] : lastOrder.completed_date?.split('T')[0];
       if (lastCalibratedDate) {
+        appliedCycleDays = lastOrder.cycle_days_snapshot;
+        cycleSource = 'work_order_snapshot';
         const d = new Date(lastCalibratedDate);
-        d.setDate(d.getDate() + activeConfig.cycle_days);
+        d.setDate(d.getDate() + appliedCycleDays);
         nextDueDate = d.toISOString().split('T')[0];
       }
     } else {
+      appliedCycleDays = activeConfig.cycle_days;
+      cycleSource = 'active_config';
       nextDueDate = inst.created_at.split('T')[0];
     }
 
@@ -47,6 +53,7 @@ router.get('/', (req, res) => {
       isOverdue = true;
     }
 
+
     if (isOverdue || openOrder) {
       overdueList.push({
         instrument_id: inst.id,
@@ -54,9 +61,13 @@ router.get('/', (req, res) => {
         serial_number: inst.serial_number,
         category: inst.category,
         location: inst.location,
-        config_id: activeConfig.id,
-        cycle_days: activeConfig.cycle_days,
-        config_version: activeConfig.version,
+        applied_cycle_days: appliedCycleDays,
+        cycle_source: cycleSource,
+        snapshot_config_id: lastOrder ? lastOrder.config_id : null,
+        snapshot_config_version: lastOrder ? lastOrder.config_version : null,
+        active_config_id: activeConfig.id,
+        active_config_cycle_days: activeConfig.cycle_days,
+        active_config_version: activeConfig.version,
         last_calibrated_date: lastCalibratedDate || null,
         next_due_date: nextDueDate || null,
         days_overdue: isOverdue ? daysOverdue : 0,
