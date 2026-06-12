@@ -2,6 +2,9 @@ $base = "http://localhost:3000/api"
 $pass = 0
 $fail = 0
 
+$runId = Get-Random -Minimum 10000 -Maximum 99999
+Write-Host "  run_id=$runId (isolation suffix for reproducible runs)"
+
 function Assert-True($name, $condition, $detail = "") {
     if ($condition) {
         Write-Host "  PASS: $name" -ForegroundColor Green
@@ -83,7 +86,7 @@ Write-Host "======================================================" -ForegroundC
 Write-Host ""
 Write-Host "--- SCENARIO 1: Basic chain + complete explain field check ---" -ForegroundColor Yellow
 
-$inst1Body = @{ name = "Explain Test Gauge"; serial_number = "SN-EXPLAIN-001" } | ConvertTo-Json
+$inst1Body = @{ name = "Explain Test Gauge"; serial_number = "SN-EXPLAIN-$runId" } | ConvertTo-Json
 $inst1 = (Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $inst1Body -ContentType "application/json").data
 $inst1Id = $inst1.id
 Write-Host "  instrument: $inst1Id"
@@ -92,7 +95,7 @@ $cfg1Body = @{ instrument_id = $inst1Id; cycle_days = 7 } | ConvertTo-Json
 $cfg1 = (Invoke-RestMethod -Uri "$base/configs" -Method Post -Body $cfg1Body -ContentType "application/json").data
 Assert-Eq "config v1 cycle=7" $cfg1.cycle_days 7
 
-$tech1Body = @{ name = "Explain Tech"; employee_id = "EMP-EXPLAIN-001" } | ConvertTo-Json
+$tech1Body = @{ name = "Explain Tech"; employee_id = "EMP-EXPLAIN-$runId" } | ConvertTo-Json
 $tech1 = (Invoke-RestMethod -Uri "$base/technicians" -Method Post -Body $tech1Body -ContentType "application/json").data
 $tech1Id = $tech1.id
 
@@ -114,7 +117,7 @@ $as1Body = @{
 } | ConvertTo-Json
 Invoke-RestMethod -Uri "$base/work-orders/$wo1Id/assign" -Method Post -Body $as1Body -ContentType "application/json" | Out-Null
 
-$cp1Body = @{ result = "Qualified"; certificate_no = "CERT-EXPLAIN-001" } | ConvertTo-Json
+$cp1Body = @{ result = "Qualified"; certificate_no = "CERT-EXPLAIN-$runId" } | ConvertTo-Json
 Invoke-RestMethod -Uri "$base/work-orders/$wo1Id/complete" -Method Post -Body $cp1Body -ContentType "application/json" | Out-Null
 
 $vr1Body = @{ verified_by = "QA Manager" } | ConvertTo-Json
@@ -230,7 +233,7 @@ Assert-Eq "open_work_order.status = created" $exp3.open_work_order.status "creat
 Write-Host ""
 Write-Host "--- SCENARIO 4: No verified history -> active config fallback ---" -ForegroundColor Yellow
 
-$inst4Body = @{ name = "No Verify Instrument"; serial_number = "SN-NOVERIFY-001" } | ConvertTo-Json
+$inst4Body = @{ name = "No Verify Instrument"; serial_number = "SN-NOVERIFY-$runId" } | ConvertTo-Json
 $inst4 = (Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $inst4Body -ContentType "application/json").data
 $inst4Id = $inst4.id
 $inst4CreatedDate = $inst4.created_at.Split('T')[0]
@@ -285,7 +288,7 @@ Write-Host "  Pre-export: wo=$beforeSnapshotWoId, cfg=$beforeSnapshotCfgId, cycl
 
 # Export
 $export = (Invoke-RestMethod -Uri "$base/data/export" -Method Get).data
-$exportInstMatches = @($export.instruments | Where-Object { $_.serial_number -eq "SN-EXPLAIN-001" })
+$exportInstMatches = @($export.instruments | Where-Object { $_.serial_number -eq "SN-EXPLAIN-$runId" })
 Assert-True "export contains instrument SN-EXPLAIN-001" ($exportInstMatches.Count -gt 0)
 $exportedWo = $export.work_orders | Where-Object { $_.id -eq $wo1Id }
 Assert-NotNull "export contains verified work order wo1Id" $exportedWo

@@ -2,6 +2,9 @@ $base = "http://localhost:3000/api"
 $pass = 0
 $fail = 0
 
+$runId = Get-Random -Minimum 10000 -Maximum 99999
+Write-Host "  run_id=$runId (用于隔离本次运行创建的数据，可重复执行)"
+
 function Assert-True($name, $condition, $detail = "") {
     if ($condition) {
         Write-Host "  PASS: $name" -ForegroundColor Green
@@ -58,7 +61,7 @@ Write-Host "======================================================" -ForegroundC
 
 # Step 1: Create instrument with 1-day cycle
 Write-Host "`n--- Step 1: Create instrument + 1-day config ---" -ForegroundColor Yellow
-$instBody = @{ name = "Snapshot Test Gauge"; serial_number = "SN-SNAPSHOT-001" } | ConvertTo-Json
+$instBody = @{ name = "Snapshot Test Gauge"; serial_number = "SN-SNAPSHOT-$runId" } | ConvertTo-Json
 $inst = (Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $instBody -ContentType "application/json").data
 $instId = $inst.id
 Write-Host "  instrument: $instId"
@@ -69,7 +72,7 @@ Assert-Eq "config v1 cycle_days=1" $cfg1.cycle_days 1
 
 # Step 2: Create technician + schedule
 Write-Host "`n--- Step 2: Create technician + schedule ---" -ForegroundColor Yellow
-$techBody = @{ name = "Regression Tech"; employee_id = "EMP-REG-001" } | ConvertTo-Json
+$techBody = @{ name = "Regression Tech"; employee_id = "EMP-REG-$runId" } | ConvertTo-Json
 $tech = (Invoke-RestMethod -Uri "$base/technicians" -Method Post -Body $techBody -ContentType "application/json").data
 $techId = $tech.id
 
@@ -175,7 +178,7 @@ Write-Host "======================================================" -ForegroundC
 
 # F1: Duplicate open work order
 Write-Host "`n--- F1: Duplicate open work order ---" -ForegroundColor Yellow
-$dupInstBody = @{ name = "Dup Test"; serial_number = "SN-DUP-VERIFY" } | ConvertTo-Json
+$dupInstBody = @{ name = "Dup Test"; serial_number = "SN-DUP-VERIFY-$runId" } | ConvertTo-Json
 $dupInst = (Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $dupInstBody -ContentType "application/json").data
 $dupCfgBody = @{ instrument_id = $dupInst.id; cycle_days = 10 } | ConvertTo-Json
 Invoke-RestMethod -Uri "$base/configs" -Method Post -Body $dupCfgBody -ContentType "application/json" | Out-Null
@@ -187,7 +190,7 @@ Try-Fail "Duplicate open order" "DUPLICATE_OPEN_ORDER" {
 
 # F2: Complete without assignment
 Write-Host "`n--- F2: Complete without assignment ---" -ForegroundColor Yellow
-$noAsstBody = @{ name = "NoAssign"; serial_number = "SN-NOASSIGN-VERIFY" } | ConvertTo-Json
+$noAsstBody = @{ name = "NoAssign"; serial_number = "SN-NOASSIGN-VERIFY-$runId" } | ConvertTo-Json
 $noAsstInst = (Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $noAsstBody -ContentType "application/json").data
 $noAsstCfg = @{ instrument_id = $noAsstInst.id; cycle_days = 5 } | ConvertTo-Json
 Invoke-RestMethod -Uri "$base/configs" -Method Post -Body $noAsstCfg -ContentType "application/json" | Out-Null
@@ -202,8 +205,8 @@ Try-Fail "Complete without assignment" "NOT_ASSIGNED" {
 Write-Host "`n--- F3: Negative cycle import ---" -ForegroundColor Yellow
 Try-Fail "Import negative cycle" "IMPORT_VALIDATION_FAILED" {
     $impData = @{
-        instruments = @(@{ id = "neg-test"; name = "Neg"; serial_number = "NEG-VERIFY" })
-        calibration_configs = @(@{ id = "neg-cfg"; instrument_id = "neg-test"; cycle_days = -5; version = 1 })
+        instruments = @(@{ id = "neg-test-$runId"; name = "Neg"; serial_number = "NEG-VERIFY-$runId" })
+        calibration_configs = @(@{ id = "neg-cfg-$runId"; instrument_id = "neg-test-$runId"; cycle_days = -5; version = 1 })
         technicians = @(); technician_schedules = @(); work_orders = @(); audit_events = @()
     } | ConvertTo-Json -Depth 10
     Invoke-RestMethod -Uri "$base/data/import" -Method Post -Body $impData -ContentType "application/json"
@@ -211,9 +214,12 @@ Try-Fail "Import negative cycle" "IMPORT_VALIDATION_FAILED" {
 
 # F4: Duplicate serial
 Write-Host "`n--- F4: Duplicate serial number ---" -ForegroundColor Yellow
+$dupSerial = "SN-DUP-SERIAL-$runId"
+$b1 = @{ name = "Dup Serial A"; serial_number = $dupSerial } | ConvertTo-Json
+Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $b1 -ContentType "application/json" | Out-Null
 Try-Fail "Duplicate serial" "DUPLICATE_SERIAL" {
-    $b = @{ name = "Dup"; serial_number = "SN-SNAPSHOT-001" } | ConvertTo-Json
-    Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $b -ContentType "application/json"
+    $b2 = @{ name = "Dup Serial B"; serial_number = $dupSerial } | ConvertTo-Json
+    Invoke-RestMethod -Uri "$base/instruments" -Method Post -Body $b2 -ContentType "application/json"
 }
 
 Write-Host "`n======================================================" -ForegroundColor Cyan

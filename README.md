@@ -252,13 +252,21 @@ created ──assign──> assigned ──complete──> completed ──verif
 
 ## PowerShell 验证脚本
 
-项目包含完整验收脚本 `test-acceptance.ps1`，覆盖 31 个测试场景：
+项目包含多套测试脚本，均使用随机 ID/序列号隔离数据，**可重复执行，无需手动清空数据库**：
+
+| 脚本 | 覆盖范围 | 可重复执行 |
+|---|---|---|
+| `test-acceptance.ps1` | 31 个基础验收场景（CRUD + 状态机 + 冲突检测 + 导出导入） | 是 |
+| `test-overdue-regression.ps1` | 逾期计算回归：快照周期 vs 活跃配置、导出导入、确定性、失败场景回归 | 是（每次运行用随机 `runId` 生成唯一序列号，避免撞库） |
+| `test-overdue-explain.ps1` | 逾期规则追溯完整链路：配置切换、退回重开、打开工单不混用、活跃配置兜底、导出导入追溯、确定性验证 | 是 |
 
 ```powershell
 # 启动服务
 npm start
 
-# 另开终端运行测试
+# 另开终端运行测试（可反复执行，不会撞库）
+powershell -ExecutionPolicy Bypass -File .\test-overdue-regression.ps1
+powershell -ExecutionPolicy Bypass -File .\test-overdue-explain.ps1
 powershell -ExecutionPolicy Bypass -File .\test-acceptance.ps1
 ```
 
