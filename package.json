@@ -1,0 +1,19 @@
+{
+  "name": "lab-calibration-scheduler",
+  "version": "1.0.0",
+  "description": "实验室仪器校准排期 REST API 服务",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "keywords": ["calibration", "laboratory", "scheduler"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "sql.js": "^1.10.3",
+    "uuid": "^9.0.1",
+    "morgan": "^1.10.0"
+  }
+}
