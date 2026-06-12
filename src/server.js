@@ -31,6 +31,7 @@ app.get('/', (req, res) => {
       overdue: '/api/overdue',
       overdueExplain: '/api/overdue/explain',
       overdueExplainByInstrument: '/api/overdue/explain/:instrumentId',
+      overdueReconciliation: '/api/overdue/reconciliation',
       audit: '/api/audit',
       dataExport: '/api/data/export',
       dataImport: '/api/data/import'

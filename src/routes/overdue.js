@@ -4,7 +4,8 @@ const { AppError } = require('../middleware/errorHandler');
 const {
   getAllOverdueExplanations,
   getOverdueListCompact,
-  buildInstrumentOverdueExplanation
+  buildInstrumentOverdueExplanation,
+  buildReconciliationView
 } = require('../overdueTrace');
 
 const router = express.Router();
@@ -93,6 +94,31 @@ router.get('/explain/:instrumentId', (req, res) => {
     meta: {
       as_of: asOfDate,
       requested_instrument_id: instrumentId
+    }
+  });
+});
+
+router.get('/reconciliation', (req, res) => {
+  const { as_of, include_non_overdue } = req.query;
+  const asOfDate = as_of || new Date().toISOString().split('T')[0];
+  const includeNonOverdue = include_non_overdue === 'true' || include_non_overdue === '1';
+
+  const result = buildReconciliationView(asOfDate, includeNonOverdue);
+
+  res.json({
+    data: result,
+    meta: {
+      as_of: asOfDate,
+      include_non_overdue: includeNonOverdue,
+      endpoint_note: '批量对账视图：一眼看出各仪器按什么规则计算、快照周期与活跃周期是否一致、未完成工单的展示规则',
+      sections: {
+        summary: '汇总计数（仪器总数、展示数、逾期数、有未完成工单数、无法计算数）',
+        cycle_source_breakdown: '按 cycle_source 分组计数（work_order_snapshot / active_config_fallback / unavailable）',
+        reason_code_breakdown: '按 reason.code 分组计数（更细粒度的原因分类）',
+        cycle_mismatch: '快照周期与当前活跃周期不一致的仪器明细（仅 work_order_snapshot 来源可能出现）',
+        open_orders: '未完成工单清单，明确标注"只展示不参与计算"规则',
+        grouped_instruments: '按 cycle_source 分组的完整仪器明细列表'
+      }
     }
   });
 });

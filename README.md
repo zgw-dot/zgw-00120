@@ -10,7 +10,7 @@
 | 校准周期配置 | `/api/configs` | 版本化配置，历史留痕，修改只影响后续工单 |
 | 技师排班 | `/api/technicians` | 技师管理 + datetime 排班，冲突检测 |
 | 校准工单 | `/api/work-orders` | 创建→指派→完成→复核 / 退回重开，状态机严格校验 |
-| 逾期清单 | `/api/overdue` | 基于配置周期计算逾期，结果重启后可复现；`/explain` 接口提供完整规则追溯 |
+| 逾期清单 | `/api/overdue` | 基于配置周期计算逾期，结果重启后可复现；`/explain` 接口提供完整规则追溯；`/reconciliation` 提供批量对账视图 |
 | 审计事件 | `/api/audit` | 全量操作留痕，按实体/时间查询 |
 | 数据导入导出 | `/api/data` | JSON 全量导出/导入，含校验（负数周期拦截） |
 
@@ -258,19 +258,16 @@ created ──assign──> assigned ──complete──> completed ──verif
 |---|---|---|
 | `test-acceptance.ps1` | 31 个基础验收场景（CRUD + 状态机 + 冲突检测 + 导出导入） | 是 |
 | `test-overdue-regression.ps1` | 逾期计算回归：快照周期 vs 活跃配置、导出导入、确定性、失败场景回归 | 是（每次运行用随机 `runId` 生成唯一序列号，避免撞库） |
-| `test-overdue-explain.ps1` | 逾期规则追溯完整链路：配置切换、退回重开、打开工单不混用、活跃配置兜底、导出导入追溯、确定性验证 | 是 |
-
-```powershell
+| `test-overdue-explain.ps1` | 逾期规则追溯完整链路：配置切换、退回重开、打开工单不混用、活跃配置兜底、导出导入追溯、确定性验证 | 是 |```powershell
 # 启动服务
 npm start
 
 # 另开终端运行测试（可反复执行，不会撞库）
 powershell -ExecutionPolicy Bypass -File .\test-overdue-regression.ps1
 powershell -ExecutionPolicy Bypass -File .\test-overdue-explain.ps1
+pwsh -ExecutionPolicy Bypass -File .\test-overdue-reconciliation.ps1
 powershell -ExecutionPolicy Bypass -File .\test-acceptance.ps1
-```
-
-### 单条 PowerShell 命令速查
+```### 单条 PowerShell 命令速查
 
 ```powershell
 # 健康检查
@@ -380,6 +377,9 @@ curl -s -X POST "$BASE/work-orders/$WO_ID/verify" \
 
 echo "===== 9. 查询逾期清单 ====="
 curl -s "$BASE/overdue" | python3 -m json.tool
+
+echo "===== 9b. 查询批量对账视图 ====="
+curl -s "$BASE/overdue/reconciliation?as_of=2026-08-01&include_non_overdue=true" | python3 -m json.tool
 
 echo "===== 10. 查询审计事件 ====="
 curl -s "$BASE/audit?entity_type=work_order&limit=5" | python3 -m json.tool

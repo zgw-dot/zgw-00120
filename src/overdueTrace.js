@@ -359,8 +359,163 @@ function getOverdueListCompact(asOfDate) {
   }));
 }
 
+function buildReconciliationView(asOfDate, includeNonOverdue = false) {
+  const explanations = getAllOverdueExplanations(asOfDate);
+
+  let filtered = explanations;
+  if (!includeNonOverdue) {
+    filtered = explanations.filter(e =>
+      e.base_calculation.is_overdue || e.open_work_order
+    );
+  }
+
+  const totalInstruments = explanations.length;
+  const shownCount = filtered.length;
+  const overdueCount = filtered.filter(e => e.base_calculation.is_overdue).length;
+  const withOpenOrderCount = filtered.filter(e => e.open_work_order).length;
+  const unavailableCount = filtered.filter(e => e.trace.cycle_source === 'unavailable').length;
+
+  const cycleSourceBreakdown = {};
+  for (const e of filtered) {
+    const src = e.trace.cycle_source;
+    cycleSourceBreakdown[src] = (cycleSourceBreakdown[src] || 0) + 1;
+  }
+
+  const reasonCodeBreakdown = {};
+  for (const e of filtered) {
+    const code = e.trace.reason.code;
+    reasonCodeBreakdown[code] = (reasonCodeBreakdown[code] || 0) + 1;
+  }
+
+  const cycleMismatchDetails = [];
+  for (const e of filtered) {
+    if (e.trace.cycle_source !== 'work_order_snapshot') continue;
+    if (!e.trace.work_order || !e.trace.active_config_now) continue;
+
+    const snapshotCycle = e.trace.work_order.cycle_days_snapshot;
+    const activeCycle = e.trace.active_config_now.cycle_days;
+    const snapshotConfigId = e.trace.work_order.config_id_snapshot;
+    const activeConfigId = e.trace.active_config_now.id;
+
+    if (snapshotCycle !== activeCycle || snapshotConfigId !== activeConfigId) {
+      cycleMismatchDetails.push({
+        instrument_id: e.instrument_id,
+        instrument_name: e.instrument_name,
+        serial_number: e.serial_number,
+        work_order_id: e.trace.work_order.id,
+        verified_date: e.trace.work_order.verified_date ? e.trace.work_order.verified_date.split('T')[0] : null,
+        snapshot_config: {
+          id: snapshotConfigId,
+          version: e.trace.work_order.config_version_snapshot,
+          cycle_days: snapshotCycle
+        },
+        active_config: {
+          id: activeConfigId,
+          version: e.trace.active_config_now.version,
+          cycle_days: activeCycle
+        },
+        cycle_diff_days: activeCycle - snapshotCycle,
+        applied_cycle_days: e.base_calculation.applied_cycle_days,
+        next_due_date: e.base_calculation.next_due_date,
+        is_overdue: e.base_calculation.is_overdue,
+        days_overdue: e.base_calculation.days_overdue,
+        mismatch_reason: e.trace.active_config_now.version_diff_note ||
+          (snapshotConfigId !== activeConfigId
+            ? '工单创建后配置版本已切换，计算仍按创建时快照'
+            : '快照周期与当前活跃周期不一致')
+      });
+    }
+  }
+
+  const openOrdersSummary = [];
+  for (const e of filtered) {
+    if (!e.open_work_order) continue;
+    openOrdersSummary.push({
+      instrument_id: e.instrument_id,
+      instrument_name: e.instrument_name,
+      serial_number: e.serial_number,
+      open_work_order: {
+        id: e.open_work_order.id,
+        status: e.open_work_order.status,
+        created_at: e.open_work_order.created_at,
+        technician_id: e.open_work_order.technician_id,
+        scheduled_start: e.open_work_order.scheduled_start,
+        scheduled_end: e.open_work_order.scheduled_end
+      },
+      cycle_source_used_for_calc: e.trace.cycle_source,
+      cycle_source_readable: e.trace.cycle_source_readable,
+      open_order_participation: '未参与 next_due_date 计算，仅作参考展示',
+      participation_note: e.open_work_order.warning || '未完成工单只展示不参与计算'
+    });
+  }
+
+  const bySourceGroups = {
+    work_order_snapshot: filtered.filter(e => e.trace.cycle_source === 'work_order_snapshot').map(e => ({
+      instrument_id: e.instrument_id,
+      instrument_name: e.instrument_name,
+      serial_number: e.serial_number,
+      applied_cycle_days: e.base_calculation.applied_cycle_days,
+      last_calibrated_date: e.base_calculation.last_calibrated_date,
+      next_due_date: e.base_calculation.next_due_date,
+      is_overdue: e.base_calculation.is_overdue,
+      days_overdue: e.base_calculation.days_overdue,
+      work_order_id: e.trace.work_order?.id,
+      verified_date: e.trace.work_order?.verified_date ? e.trace.work_order.verified_date.split('T')[0] : null,
+      snapshot_config_id: e.trace.work_order?.config_id_snapshot,
+      snapshot_config_version: e.trace.work_order?.config_version_snapshot
+    })),
+    active_config_fallback: filtered.filter(e => e.trace.cycle_source === 'active_config_fallback').map(e => ({
+      instrument_id: e.instrument_id,
+      instrument_name: e.instrument_name,
+      serial_number: e.serial_number,
+      applied_cycle_days: e.base_calculation.applied_cycle_days,
+      next_due_date: e.base_calculation.next_due_date,
+      is_overdue: e.base_calculation.is_overdue,
+      days_overdue: e.base_calculation.days_overdue,
+      fallback_reason_code: e.trace.reason.code,
+      fallback_reason_message: e.trace.reason.message,
+      active_config_id: e.trace.active_config_now?.id,
+      active_config_version: e.trace.active_config_now?.version
+    })),
+    unavailable: filtered.filter(e => e.trace.cycle_source === 'unavailable').map(e => ({
+      instrument_id: e.instrument_id,
+      instrument_name: e.instrument_name,
+      serial_number: e.serial_number,
+      unavailable_reason_code: e.trace.reason.code,
+      unavailable_reason_message: e.trace.reason.message,
+      has_open_work_order: !!e.open_work_order
+    }))
+  };
+
+  return {
+    summary: {
+      as_of: asOfDate,
+      total_instruments: totalInstruments,
+      shown_instruments: shownCount,
+      overdue_count: overdueCount,
+      with_open_order_count: withOpenOrderCount,
+      unavailable_count: unavailableCount,
+      include_non_overdue: includeNonOverdue
+    },
+    cycle_source_breakdown: cycleSourceBreakdown,
+    reason_code_breakdown: reasonCodeBreakdown,
+    cycle_mismatch: {
+      count: cycleMismatchDetails.length,
+      note: '快照周期与当前活跃周期不一致的仪器列表。计算始终用工单创建时的快照，活跃配置仅作参考展示。',
+      details: cycleMismatchDetails
+    },
+    open_orders: {
+      count: openOrdersSummary.length,
+      participation_rule: '未完成工单（created/assigned/completed/returned）只展示不参与计算，next_due_date 仅基于已复核工单或活跃配置。',
+      details: openOrdersSummary
+    },
+    grouped_instruments: bySourceGroups
+  };
+}
+
 module.exports = {
   buildInstrumentOverdueExplanation,
   getAllOverdueExplanations,
-  getOverdueListCompact
+  getOverdueListCompact,
+  buildReconciliationView
 };
